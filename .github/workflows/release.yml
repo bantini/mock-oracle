@@ -2,18 +2,19 @@ name: Release
 
 # Pushing a tag like v0.1.0 builds the npm package with prebuilt binaries for
 # every supported platform, tests it, publishes it to npm, and pushes the
-# Docker image to ghcr.io/bantini/mock-oracle. Pull requests that touch this
-# file (and manual runs) do everything except publish.
+# Docker image to ghcr.io/bantini/mock-oracle. Pull requests (and manual runs)
+# do everything except publish, so a change that would break a release shows
+# up before it is tagged.
 
 on:
   push:
     tags: ['v*']
   pull_request:
-    paths:
-      - .github/workflows/release.yml
-      - Dockerfile
-      - crates/mock-oracle-node/package.json
   workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -285,3 +286,18 @@ jobs:
           esac
           docker buildx imagetools create $tags $(printf "$IMAGE@sha256:%s " *)
           docker buildx imagetools inspect "$IMAGE:$VERSION"
+      - name: Check the image can be pulled without logging in
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # GHCR makes a new package private, and GITHUB_TOKEN cannot change
+          # that. After the first release, set the package to public once under
+          # the package's settings on GitHub (Danger Zone, Change visibility).
+          repo="${IMAGE#ghcr.io/}"
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:$repo:pull" | jq -r .token) || token=
+          if [ -n "$token" ] && curl -fsS -o /dev/null -H "Authorization: Bearer $token" \
+              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" "https://ghcr.io/v2/$repo/manifests/$VERSION"; then
+            echo "The image is public."
+          else
+            echo "::warning::$IMAGE is private, so pipelines cannot pull it without logging in. Make it public in the package settings: https://github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${GITHUB_REPOSITORY#*/}/settings"
+          fi

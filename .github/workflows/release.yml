@@ -51,12 +51,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux binaries are linked with zig against glibc 2.17, so they load
-          # on any distribution from the last decade, not just the runner's.
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: '--zig --zig-abi-suffix 2.17' }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, zig: '--zig --zig-abi-suffix 2.17' }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: '--zig', rustflags: '-C target-feature=-crt-static' }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, zig: '--zig', rustflags: '-C target-feature=-crt-static' }
+          # Linux binaries are built with cargo-zigbuild against glibc 2.17, so
+          # they load on any distribution from the last decade, not just the
+          # runner's. (napi's own --zig mode rejects a linker flag that current
+          # rustc passes for aarch64.)
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zigbuild: x86_64-unknown-linux-gnu.2.17, node: linux-x64-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, zigbuild: aarch64-unknown-linux-gnu.2.17, node: linux-arm64-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, zigbuild: x86_64-unknown-linux-musl, node: linux-x64-musl, rustflags: '-C target-feature=-crt-static' }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, zigbuild: aarch64-unknown-linux-musl, node: linux-arm64-musl, rustflags: '-C target-feature=-crt-static' }
           - { os: macos-latest, target: x86_64-apple-darwin }
           - { os: macos-latest, target: aarch64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
@@ -75,14 +77,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - if: matrix.zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
       - run: npm ci
-      - run: npx napi build --platform --release --strip --target ${{ matrix.target }} ${{ matrix.zig }}
+      - if: '!matrix.zigbuild'
+        run: npx napi build --platform --release --strip --target ${{ matrix.target }}
+      - if: matrix.zigbuild
+        run: |
+          python3 -m venv /tmp/zig && export PATH="/tmp/zig/bin:$PATH"
+          pip install cargo-zigbuild==0.23.4 ziglang==0.16.0
+          cargo zigbuild --release -p mock-oracle-node --target ${{ matrix.zigbuild }}
+          cp ../../target/${{ matrix.target }}/release/libmock_oracle_node.so mock-oracle.${{ matrix.node }}.node
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+          CARGO_PROFILE_RELEASE_STRIP: symbols
       - uses: actions/upload-artifact@v4
         with:
           name: binding-${{ matrix.target }}

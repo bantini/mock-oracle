@@ -14,6 +14,12 @@ A slim, in-memory stand-in for Oracle Database in CI/CD. It runs Oracle SQL and 
 
 ## Use from Node
 
+```sh
+npm install --save-dev mock-oracle oracledb
+```
+
+The package ships prebuilt binaries for Linux (x64 and arm64, glibc and Alpine/musl), macOS (Intel and Apple silicon) and Windows x64, so installing it needs no Rust toolchain.
+
 ```js
 const { MockOracle } = require('mock-oracle');
 const oracledb = require('oracledb');
@@ -39,12 +45,22 @@ await db.stop();
 ## Use from Docker
 
 ```sh
-docker build -t mock-oracle .
-docker run -p 1521:1521 -v "$PWD/sql:/docker-entrypoint-initdb.d" mock-oracle
+docker run -p 1521:1521 -v "$PWD/sql:/docker-entrypoint-initdb.d" ghcr.io/bantini/mock-oracle
 # connect with any user name, password "oracle", connect string localhost:1521/FREEPDB1
 ```
 
 At startup the server runs every `.sql` file in `/docker-entrypoint-initdb.d`, in name order. Point `MOCK_ORACLE_SEED` at another file or directory to change that.
+
+The image is published for `linux/amd64` and `linux/arm64`, tagged with each version (`0.1.0`), its minor line (`0.1`) and `latest`. In a GitHub Actions job it can run as a service container:
+
+```yaml
+services:
+  oracle:
+    image: ghcr.io/bantini/mock-oracle:0.1
+    ports: ['1521:1521']
+```
+
+To build the image yourself instead: `docker build -t mock-oracle .`
 
 ## Logging in
 
@@ -68,3 +84,10 @@ Any user name and any service name are accepted. Every user shares one password:
 cargo test --workspace
 cd crates/mock-oracle-node && npm install && npm run build:debug && npm test
 ```
+
+## Release
+
+1. Set the same version in `Cargo.toml` (`[workspace.package]`) and `crates/mock-oracle-node/package.json`, and merge that to `main`.
+2. Tag it and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
+
+The [Release workflow](.github/workflows/release.yml) then builds and tests the native binaries on every platform, pushes the Docker image to `ghcr.io/bantini/mock-oracle`, publishes `mock-oracle` to npm, and creates a GitHub release. Publishing to npm needs an npm automation token in the repository secret `NPM_TOKEN`. The first time the image is pushed, GitHub creates its package as private. Make it public once under the package's settings (Danger Zone, Change visibility) so pipelines can pull it without logging in; the workflow warns while it is still private. A version with a suffix such as `0.2.0-rc.1` is published to npm under the `next` tag and does not move the `latest` Docker tag.

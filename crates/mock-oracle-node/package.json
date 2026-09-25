@@ -2,14 +2,29 @@
   "name": "mock-oracle",
   "version": "0.1.0",
   "description": "In-memory Oracle stand-in for CI that node-oracledb can connect to",
+  "keywords": [
+    "oracle",
+    "oracledb",
+    "mock",
+    "testing",
+    "ci",
+    "plsql"
+  ],
+  "homepage": "https://github.com/bantini/mock-oracle#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bantini/mock-oracle.git",
+    "directory": "crates/mock-oracle-node"
+  },
   "main": "index.js",
   "types": "index.d.ts",
-  "repository": "github:bantini/mock-oracle",
   "napi": {
     "name": "mock-oracle",
     "triples": {
       "additional": [
         "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
         "aarch64-apple-darwin"
       ]
     }
@@ -30,5 +45,8 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

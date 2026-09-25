@@ -30,6 +30,9 @@ pub struct Env {
     pub output: RefCell<Output>,
     /// How deeply PL/SQL calls are nested.
     pub depth: Cell<u32>,
+    /// The NEXTVAL of each sequence for the row being processed: Oracle advances a
+    /// sequence once per row, however often the row mentions it.
+    pub row_sequences: RefCell<HashMap<String, i128>>,
 }
 
 impl Env {
@@ -45,6 +48,7 @@ impl Env {
             currval: RefCell::new(HashMap::new()),
             output: RefCell::new(Output::default()),
             depth: Cell::new(0),
+            row_sequences: RefCell::new(HashMap::new()),
         }
     }
 
@@ -113,6 +117,67 @@ pub struct Ex<'a> {
     pub db: &'a Database,
     /// PL/SQL variables, when running inside a block. Column names win over them.
     pub vars: Option<&'a dyn VarLookup>,
+}
+
+/// The direct subexpressions of an expression, not looking into subqueries.
+fn children(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Literal(_)
+        | Expr::Bind(_)
+        | Expr::Column { .. }
+        | Expr::RowNum
+        | Expr::CountStar
+        | Expr::Sequence { .. }
+        | Expr::Subquery(_)
+        | Expr::Exists(_) => Vec::new(),
+        Expr::Neg(a) | Expr::Not(a) => vec![a],
+        Expr::Binary(_, a, b) => vec![a, b],
+        Expr::IsNull { expr, .. } | Expr::InSubquery { expr, .. } => vec![expr],
+        Expr::Between {
+            expr, low, high, ..
+        } => vec![expr, low, high],
+        Expr::InList { expr, list, .. } => std::iter::once(&**expr).chain(list).collect(),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => std::iter::once(&**expr)
+            .chain(std::iter::once(&**pattern))
+            .chain(escape.as_deref())
+            .collect(),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => operand
+            .as_deref()
+            .into_iter()
+            .chain(whens.iter().flat_map(|(w, t)| [w, t]))
+            .chain(else_.as_deref())
+            .collect(),
+        Expr::Function { args, .. } => args.iter().collect(),
+    }
+}
+
+fn nextval_names<'e>(e: &'e Expr, out: &mut Vec<&'e str>) {
+    if let Expr::Sequence { name, next: true } = e {
+        if !out.contains(&name.as_str()) {
+            out.push(name);
+        }
+    }
+    for c in children(e) {
+        nextval_names(c, out);
+    }
+}
+
+/// Clears the per-row sequence values when a row is done.
+pub struct RowSequences<'a>(&'a Env);
+
+impl Drop for RowSequences<'_> {
+    fn drop(&mut self) {
+        self.0.row_sequences.borrow_mut().clear();
+    }
 }
 
 /// Names a SQL statement inside PL/SQL can see besides columns: variables, record
@@ -515,6 +580,18 @@ impl Ex<'_> {
 
         let mut out: KeyedRows = Vec::new();
         let compute = |scope: &Scope, out: &mut KeyedRows| -> Result<(), OraError> {
+            let _row = self.start_row(
+                items
+                    .iter()
+                    .filter_map(|(i, _)| match i {
+                        Item::Expr(e) => Some(*e),
+                        Item::Source(_) => None,
+                    })
+                    .chain(keys.iter().filter_map(|k| match k {
+                        SortKey::Expr(e) => Some(*e),
+                        SortKey::Output(_) => None,
+                    })),
+            )?;
             let mut values = Vec::with_capacity(items.len());
             for (item, _) in &items {
                 values.push(match item {
@@ -815,15 +892,50 @@ impl Ex<'_> {
 
     // ---- expressions ----
 
-    fn sequence(&self, name: &str, next: bool) -> Result<Value, OraError> {
+    /// Starts a row: advances each sequence whose NEXTVAL appears in `exprs` once, so
+    /// every NEXTVAL and CURRVAL in the row sees that value. The values last until the
+    /// returned guard is dropped.
+    pub fn start_row<'e>(
+        &self,
+        exprs: impl IntoIterator<Item = &'e Expr>,
+    ) -> Result<RowSequences<'_>, OraError> {
+        self.env.row_sequences.borrow_mut().clear();
+        let guard = RowSequences(self.env);
+        let mut names = Vec::new();
+        for e in exprs {
+            nextval_names(e, &mut names);
+        }
+        for name in names {
+            let v = self.advance_sequence(name)?;
+            let short = name.rsplit('.').next().unwrap_or(name);
+            self.env
+                .row_sequences
+                .borrow_mut()
+                .insert(short.to_string(), v);
+        }
+        Ok(guard)
+    }
+
+    fn advance_sequence(&self, name: &str) -> Result<i128, OraError> {
         let short = name.rsplit('.').next().unwrap_or(name);
         let Some(def) = self.db.sequence_def(short) else {
             return Err(OraError::new(2289, "sequence does not exist"));
         };
-        let v = if next {
-            let v = self.db.next_sequence(short, &def)?;
-            self.env.currval.borrow_mut().insert(short.to_string(), v);
+        let v = self.db.next_sequence(short, &def)?;
+        self.env.currval.borrow_mut().insert(short.to_string(), v);
+        Ok(v)
+    }
+
+    fn sequence(&self, name: &str, next: bool) -> Result<Value, OraError> {
+        let short = name.rsplit('.').next().unwrap_or(name);
+        if self.db.sequence_def(short).is_none() {
+            return Err(OraError::new(2289, "sequence does not exist"));
+        }
+        let cached = self.env.row_sequences.borrow().get(short).copied();
+        let v = if let Some(v) = cached {
             v
+        } else if next {
+            self.advance_sequence(short)?
         } else {
             match self.env.currval.borrow().get(short) {
                 Some(v) => *v,

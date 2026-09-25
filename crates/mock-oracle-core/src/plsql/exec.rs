@@ -10,7 +10,7 @@ use std::sync::Arc;
 use bigdecimal::{RoundingMode, ToPrimitive};
 
 use super::*;
-use crate::ast::{Expr, Statement};
+use crate::ast::{BinaryOp, Expr, Statement};
 use crate::catalog::{Catalog, TableColumn};
 use crate::eval::{Env, Ex, Scope, VarLookup};
 use crate::parser::{self, pls};
@@ -454,6 +454,35 @@ impl<'h, H: Host> Interp<'h, H> {
     }
 
     fn eval_bool(&mut self, e: &Expr) -> R<Option<bool>> {
+        // Short-circuit so calls in operands that do not decide the result never run.
+        if self.has_call(e) {
+            match e {
+                Expr::Binary(BinaryOp::And, a, b) => {
+                    let l = self.eval_bool(a)?;
+                    if l == Some(false) {
+                        return Ok(Some(false));
+                    }
+                    return Ok(match (l, self.eval_bool(b)?) {
+                        (_, Some(false)) => Some(false),
+                        (Some(true), Some(true)) => Some(true),
+                        _ => None,
+                    });
+                }
+                Expr::Binary(BinaryOp::Or, a, b) => {
+                    let l = self.eval_bool(a)?;
+                    if l == Some(true) {
+                        return Ok(Some(true));
+                    }
+                    return Ok(match (l, self.eval_bool(b)?) {
+                        (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    });
+                }
+                Expr::Not(a) => return Ok(self.eval_bool(a)?.map(|b| !b)),
+                _ => {}
+            }
+        }
         let e = self.resolve_calls(e)?;
         let vars = Vars {
             frames: &self.frames,
@@ -479,12 +508,95 @@ impl<'h, H: Host> Interp<'h, H> {
             .ok_or_else(|| Exc::from(value_error("")))
     }
 
+    /// Whether two values are equal, as CASE and DECODE compare them.
+    fn equal(&self, a: &Value, b: &Value) -> R<bool> {
+        let fmt = &self.host.env().nls_date_format;
+        Ok(crate::value::compare(a, b, fmt)? == Some(std::cmp::Ordering::Equal))
+    }
+
+    /// Evaluates an expression whose operands are evaluated only when needed: CASE,
+    /// AND, OR, NVL, NVL2, COALESCE and DECODE. Returns `None` for other expressions.
+    fn eval_lazy(&mut self, e: &Expr) -> R<Option<Value>> {
+        Ok(Some(match e {
+            Expr::Binary(BinaryOp::And | BinaryOp::Or, ..) => {
+                self.eval_bool(e)?.map_or(Value::Null, Value::Boolean)
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                let subject = match operand {
+                    Some(o) => Some(self.eval(o)?),
+                    None => None,
+                };
+                for (when, then) in whens {
+                    let hit = match &subject {
+                        Some(s) => {
+                            let w = self.eval(when)?;
+                            self.equal(s, &w)?
+                        }
+                        None => self.eval_bool(when)? == Some(true),
+                    };
+                    if hit {
+                        return Ok(Some(self.eval(then)?));
+                    }
+                }
+                match else_ {
+                    Some(x) => self.eval(x)?,
+                    None => Value::Null,
+                }
+            }
+            Expr::Function { name, args, .. } if self.find_routine(name).is_none() => {
+                match (name.as_str(), args.len()) {
+                    ("NVL", 2) | ("COALESCE", 1..) => {
+                        for a in args {
+                            let v = self.eval(a)?;
+                            if !v.is_null() {
+                                return Ok(Some(v));
+                            }
+                        }
+                        Value::Null
+                    }
+                    ("NVL2", 3) => {
+                        if self.eval(&args[0])?.is_null() {
+                            self.eval(&args[2])?
+                        } else {
+                            self.eval(&args[1])?
+                        }
+                    }
+                    ("DECODE", 3..) => {
+                        let v = self.eval(&args[0])?;
+                        let mut rest = args[1..].chunks(2);
+                        for pair in rest.by_ref() {
+                            let [search, result] = pair else {
+                                // The odd one out is the default.
+                                return Ok(Some(self.eval(&pair[0])?));
+                            };
+                            let s = self.eval(search)?;
+                            if (v.is_null() && s.is_null()) || self.equal(&v, &s)? {
+                                return Ok(Some(self.eval(result)?));
+                            }
+                        }
+                        Value::Null
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        }))
+    }
+
     /// Calls to procedures and functions in a PL/SQL expression run here, with full
     /// access to the session, and are replaced by their results. Calls inside
-    /// subqueries are left to SQL, where functions may only read.
+    /// subqueries are left to SQL, where functions may only read. Calls in operands
+    /// that CASE, AND, OR and the NULL functions skip do not run.
     fn resolve_calls(&mut self, e: &Expr) -> R<Expr> {
         if !self.has_call(e) {
             return Ok(e.clone());
+        }
+        if let Some(v) = self.eval_lazy(e)? {
+            return Ok(Expr::Literal(v));
         }
         Ok(match e {
             Expr::Column { table: None, name } => match self.find_routine(name) {
@@ -1582,6 +1694,7 @@ impl<'h, H: Host> Interp<'h, H> {
                 out.enabled = false;
                 out.lines.clear();
                 out.partial.clear();
+                out.bytes = 0;
                 Ok(true)
             }
             "DBMS_OUTPUT.GET_LINE" => {
@@ -1604,7 +1717,7 @@ impl<'h, H: Host> Interp<'h, H> {
                     )
                     .into());
                 }
-                let line = self.host.env().output.borrow_mut().lines.pop_front();
+                let line = self.host.env().output.borrow_mut().take_line();
                 let status = if line.is_some() { 0 } else { 1 };
                 self.assign(&targets[0], line.map_or(Value::Null, Value::varchar))?;
                 self.assign(&targets[1], Value::number(status))?;
@@ -1628,6 +1741,7 @@ pub struct Output {
     pub enabled: bool,
     pub lines: VecDeque<String>,
     pub partial: String,
+    /// Bytes held in the buffer, counted against its limit.
     bytes: usize,
 }
 
@@ -1650,5 +1764,12 @@ impl Output {
             self.lines.push_back(std::mem::take(&mut self.partial));
         }
         Ok(())
+    }
+
+    /// Removes the oldest complete line, as GET_LINE does.
+    fn take_line(&mut self) -> Option<String> {
+        let line = self.lines.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(line.len());
+        Some(line)
     }
 }

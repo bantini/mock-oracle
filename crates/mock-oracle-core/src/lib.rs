@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub use error::OraError;
-pub use session::Session;
+pub use session::{Savepoint, Session};
 pub use value::{format_number, SqlType, Value};
 
 use catalog::Catalog;

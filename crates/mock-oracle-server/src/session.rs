@@ -593,6 +593,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         // OUT bind values of each execution, for PL/SQL and RETURNING INTO.
         let mut out_rows = Vec::new();
         let tz = self.db().time_zone_offset();
+        // An OUT value that does not fit fails the call and undoes all of its executions.
+        let savepoint = self.db().savepoint();
         for i in 0..runs {
             let values = bind_rows.get(i).map_or(&[][..], Vec::as_slice);
             match self.db().execute(&sql, values) {
@@ -602,8 +604,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                         let mut row = WriteBuf::new();
                         if let Err(e) = write_out_binds(&mut row, &r.out_binds, &binds, values, tz)
                         {
+                            self.db().rollback_to(savepoint);
                             let status = self.call_status();
-                            write_error(out, status, cursor_id as u16, rows_affected, Some(&e));
+                            write_error(out, status, cursor_id as u16, 0, Some(&e));
                             return;
                         }
                         out_rows.push((std::mem::take(&mut r.out_binds), row));

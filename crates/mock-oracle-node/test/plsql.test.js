@@ -205,10 +205,15 @@ test('errors raised in PL/SQL reach the client and undo the block', async () => 
   );
   const r = await conn.execute('select sum(balance) from accounts');
   assert.deepEqual(r.rows, [[150]]);
+  // An OUT value that does not fit fails the block and undoes its changes.
   await assert.rejects(
-    conn.execute("begin :s := 'too long for the buffer'; end;", { s: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 5 } }),
+    conn.execute("begin update accounts set balance = 0; :s := 'too long for the buffer'; end;", {
+      s: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 5 },
+    }),
     /ORA-06502/,
   );
+  const after = await conn.execute('select sum(balance) from accounts');
+  assert.deepEqual(after.rows, [[150]]);
 });
 
 test('the drop-if-exists pattern and DBMS_OUTPUT work', async () => {

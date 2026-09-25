@@ -44,6 +44,13 @@ struct Txn {
     log: Vec<Change>,
 }
 
+/// A point in a session's transaction that later changes can be undone to.
+#[derive(Debug, Clone, Copy)]
+pub struct Savepoint {
+    commits: u64,
+    changes: usize,
+}
+
 /// A connection's view of a [`Database`]. Changes are private to the session until
 /// [`Session::commit`]; dropping the session rolls them back.
 #[derive(Debug)]
@@ -142,17 +149,10 @@ impl Session {
         block: &crate::plsql::Block,
         binds: Vec<Value>,
     ) -> Result<Vec<Value>, OraError> {
-        let commits = self.commits;
-        let saved = self.txn.as_ref().map_or(0, |t| t.log.len());
+        let savepoint = self.savepoint();
         let result = exec::run_block(self, block, binds);
         if result.is_err() {
-            let keep = if self.commits == commits { saved } else { 0 };
-            if let Some(txn) = &mut self.txn {
-                undo(txn, keep.min(txn.log.len()));
-                if txn.log.is_empty() {
-                    self.txn = None;
-                }
-            }
+            self.rollback_to(savepoint);
         }
         result
     }
@@ -274,6 +274,31 @@ impl Session {
         next.version = state.version + 1;
         *state = next;
         Ok(())
+    }
+
+    /// Marks the current point of the transaction, to undo later work with
+    /// [`Session::rollback_to`].
+    pub fn savepoint(&self) -> Savepoint {
+        Savepoint {
+            commits: self.commits,
+            changes: self.txn.as_ref().map_or(0, |t| t.log.len()),
+        }
+    }
+
+    /// Undoes the uncommitted changes made since `savepoint`. Changes committed since
+    /// then stay; only those after the last commit are undone.
+    pub fn rollback_to(&mut self, savepoint: Savepoint) {
+        let keep = if self.commits == savepoint.commits {
+            savepoint.changes
+        } else {
+            0
+        };
+        if let Some(txn) = &mut self.txn {
+            undo(txn, keep.min(txn.log.len()));
+            if txn.log.is_empty() {
+                self.txn = None;
+            }
+        }
     }
 
     pub fn rollback(&mut self) {
@@ -991,6 +1016,21 @@ fn insert(ctx: &Dml, txn: &mut Txn, ins: &Insert) -> DmlResult {
         }
         None => (0..t.columns.len()).collect(),
     };
+    // Defaults of the columns the statement leaves out.
+    let defaults: Vec<&Expr> = t
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !targets.contains(i))
+        .filter_map(|(_, c)| c.default.as_ref())
+        .collect();
+    // A VALUES list is one row; its sequence values also serve the defaults.
+    let values_row = match &ins.source {
+        InsertSource::Values(exprs) => {
+            Some(ex.start_row(exprs.iter().chain(defaults.iter().copied()))?)
+        }
+        InsertSource::Query(_) => None,
+    };
     let sources: Vec<Vec<Value>> = match &ins.source {
         InsertSource::Values(exprs) => {
             if exprs.len() > targets.len() {
@@ -1018,6 +1058,10 @@ fn insert(ctx: &Dml, txn: &mut Txn, ins: &Insert) -> DmlResult {
     };
     let mut rows = Vec::with_capacity(sources.len());
     for src in sources {
+        let _row = match values_row {
+            Some(_) => None,
+            None => Some(ex.start_row(defaults.iter().copied())?),
+        };
         let mut values = vec![None; t.columns.len()];
         for (&i, v) in targets.iter().zip(src) {
             values[i] = Some(v);
@@ -1038,6 +1082,7 @@ fn insert(ctx: &Dml, txn: &mut Txn, ins: &Insert) -> DmlResult {
         check_row(&ex, t, &full, false)?;
         rows.push(full);
     }
+    drop(values_row);
     let cols = table_scope_cols(t, &t.name);
     let returned = returning_rows(
         &ex,
@@ -1111,6 +1156,7 @@ fn update(ctx: &Dml, txn: &mut Txn, upd: &Update) -> DmlResult {
     let mut changes = Vec::new();
     let mut olds = Vec::new();
     for (id, old) in matching_rows(&ex, t, &cols, &upd.where_)? {
+        let _row = ex.start_row(upd.assignments.iter().map(|(_, e)| e))?;
         let mut new = old.clone();
         for ((_, e), &i) in upd.assignments.iter().zip(&targets) {
             let v = ex.eval(e, &Scope::row(&cols, &old, None))?;

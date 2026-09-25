@@ -497,3 +497,121 @@ fn update_returning_bind_positions() {
         [BindDir::In, BindDir::Returning, BindDir::Returning]
     );
 }
+
+#[test]
+fn nextval_advances_once_per_row() {
+    let db = db();
+    db.run_script(
+        "create sequence s;
+         create table t (id number, ref number, note varchar2(10) default 'x');
+         create table src (x number);
+         insert into src values (1);
+         insert into src values (2);
+         insert into src values (3);",
+    )
+    .unwrap();
+    let mut ses = db.session("U");
+    let row = |ses: &mut Session, sql: &str| ses.execute(sql, &[]).unwrap().rows.remove(0);
+    // CURRVAL before NEXTVAL in the same row sees the new value, even in a new session.
+    assert_eq!(
+        row(&mut ses, "select s.currval, s.nextval, s.nextval from dual"),
+        [n(1), n(1), n(1)]
+    );
+    ses.execute("insert into t (id, ref) values (s.nextval, s.nextval)", &[])
+        .unwrap();
+    assert_eq!(row(&mut ses, "select id, ref from t"), [n(2), n(2)]);
+    // One value per row.
+    let r = ses
+        .execute("select s.nextval, x from src order by x", &[])
+        .unwrap();
+    let ids: Vec<Value> = r.rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(ids, [n(3), n(4), n(5)]);
+    ses.execute("update t set id = s.nextval, ref = s.currval", &[])
+        .unwrap();
+    assert_eq!(row(&mut ses, "select id, ref from t"), [n(6), n(6)]);
+    ses.execute("insert into t (id, ref) select s.nextval, x from src", &[])
+        .unwrap();
+    assert_eq!(
+        ses.execute("select count(distinct id) from t where ref < 5", &[])
+            .unwrap()
+            .rows[0][0],
+        n(3)
+    );
+    // Outside a row, each NEXTVAL in PL/SQL advances.
+    let out = block(
+        &mut ses,
+        "begin :a := s.nextval; :b := s.nextval; end;",
+        &[Value::Null, Value::Null],
+    );
+    assert_eq!(out, [n(10), n(11)]);
+}
+
+#[test]
+fn skipped_operands_do_not_call_functions() {
+    let db = db();
+    db.run_script(
+        "create function boom return number is
+         begin
+             raise_application_error(-20001, 'should not run');
+         end;
+         /
+         create function one return number is begin return 1; end;
+         /",
+    )
+    .unwrap();
+    let mut ses = db.session("U");
+    let out = block(
+        &mut ses,
+        "declare n number := 0;
+         begin
+             :a := case when n = 0 then 0 else boom() end;
+             :b := nvl(1, boom());
+             :c := coalesce(null, one(), boom());
+             :d := decode(one(), 1, 'one', boom());
+             :e := nvl2(null, boom(), 'else');
+             if n = 1 and boom() = 1 then :f := 'bad'; else :f := 'and'; end if;
+             if one() = 1 or boom() = 1 then :g := 'or'; end if;
+             :h := case one() when 2 then boom() when 1 then 'hit' end;
+         end;",
+        &vec![Value::Null; 8],
+    );
+    assert_eq!(
+        out,
+        [
+            n(0),
+            n(1),
+            n(1),
+            s("one"),
+            s("else"),
+            s("and"),
+            s("or"),
+            s("hit")
+        ]
+    );
+    // The branch that is taken still runs.
+    let e = err(
+        &mut ses,
+        "begin :x := case when 1 = 1 then boom() end; end;",
+        &[Value::Null],
+    );
+    assert_eq!(e.code, 20001);
+}
+
+#[test]
+fn dbms_output_limit_counts_only_buffered_bytes() {
+    let db = db();
+    let mut ses = db.session("U");
+    // 1.5 MB written in total, but never more than 1 KB held at once.
+    block(
+        &mut ses,
+        "declare line varchar2(2000); status number;
+         begin
+             dbms_output.enable;
+             for i in 1 .. 1500 loop
+                 dbms_output.put_line(rpad('x', 1000, 'x'));
+                 dbms_output.get_line(line, status);
+             end loop;
+         end;",
+        &[],
+    );
+}

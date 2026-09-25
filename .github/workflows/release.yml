@@ -78,7 +78,7 @@ jobs:
       - if: matrix.zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.1
+          version: 0.16.0
       - run: npm ci
       - run: npx napi build --platform --release --strip --target ${{ matrix.target }} ${{ matrix.zig }}
         env:

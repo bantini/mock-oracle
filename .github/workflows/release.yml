@@ -1,0 +1,281 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds the npm package with prebuilt binaries for
+# every supported platform, tests it, publishes it to npm, and pushes the
+# Docker image to ghcr.io/bantini/mock-oracle. Pull requests that touch this
+# file (and manual runs) do everything except publish.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Dockerfile
+      - crates/mock-oracle-node/package.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          version=$(node -p "require('./crates/mock-oracle-node/package.json').version")
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::package.json is $version but Cargo.toml is $cargo_version"
+            exit 1
+          fi
+          if [ "$PUBLISH" = true ] && [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-node:
+    name: build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux binaries are linked with zig against glibc 2.17, so they load
+          # on any distribution from the last decade, not just the runner's.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: '--zig --zig-abi-suffix 2.17' }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, zig: '--zig --zig-abi-suffix 2.17' }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: '--zig', rustflags: '-C target-feature=-crt-static' }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, zig: '--zig', rustflags: '-C target-feature=-crt-static' }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    defaults:
+      run:
+        working-directory: crates/mock-oracle-node
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - if: matrix.zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - run: npm ci
+      - run: npx napi build --platform --release --strip --target ${{ matrix.target }} ${{ matrix.zig }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binding-${{ matrix.target }}
+          path: crates/mock-oracle-node/*.node
+          if-no-files-found: error
+
+  test-node:
+    name: test ${{ matrix.name }}
+    needs: build-node
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64, os: ubuntu-latest }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: alpine-x64, os: ubuntu-latest, alpine: true }
+          - { name: alpine-arm64, os: ubuntu-24.04-arm, alpine: true }
+          - { name: macos-arm64, os: macos-latest }
+          - { name: windows-x64, os: windows-latest }
+    defaults:
+      run:
+        working-directory: crates/mock-oracle-node
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binding-*
+          path: crates/mock-oracle-node
+          merge-multiple: true
+      - if: '!matrix.alpine'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - if: '!matrix.alpine'
+        run: npm ci && npm install --no-save oracledb && npm test
+      - if: matrix.alpine
+        run: >
+          docker run --rm -v "$PWD":/pkg -w /pkg node:22-alpine
+          sh -c 'npm ci && npm install --no-save oracledb && npm test'
+
+  pack:
+    needs: [version, test-node]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mock-oracle-node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binding-*
+          path: crates/mock-oracle-node
+          merge-multiple: true
+      - run: cp ../../README.md .
+      - run: npm pack
+      - name: Check every binary is in the package
+        run: |
+          tar -tzf mock-oracle-*.tgz | tee contents.txt
+          for p in linux-x64-gnu linux-arm64-gnu linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64 win32-x64-msvc; do
+            grep -q "package/mock-oracle.$p.node" contents.txt || { echo "::error::missing $p"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: crates/mock-oracle-node/mock-oracle-*.tgz
+
+  publish-npm:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [pack, docker-manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::warning::NPM_TOKEN is not set, so the npm package was not published"
+            exit 0
+          fi
+          tag=latest
+          case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac
+          npm publish ./mock-oracle-*.tgz --access public --provenance --tag "$tag"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" mock-oracle-*.tgz --repo "$GITHUB_REPOSITORY" --generate-notes $(case "$GITHUB_REF_NAME" in *-*) echo --prerelease ;; esac)
+
+  docker:
+    name: docker ${{ matrix.arch }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: mock-oracle:test
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+      - run: docker run -d --name mock-oracle -p 1521:1521 mock-oracle:test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Connect with node-oracledb
+        working-directory: crates/mock-oracle-node
+        run: |
+          npm install --no-save oracledb
+          node scripts/smoke.js localhost:1521/FREEPDB1
+      - if: failure()
+        run: docker logs mock-oracle
+      - if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - if: env.PUBLISH == 'true'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=In-memory Oracle stand-in for CI that thin Oracle drivers can connect to
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+      - if: env.PUBLISH == 'true'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  docker-manifest:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, docker, test-node]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Tag the multi-arch image
+        working-directory: /tmp/digests
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tags="-t $IMAGE:$VERSION"
+          # Pre-releases (0.2.0-rc.1) get only their own tag.
+          case "$VERSION" in
+            *-*) ;;
+            *) tags="$tags -t $IMAGE:${VERSION%.*} -t $IMAGE:latest" ;;
+          esac
+          docker buildx imagetools create $tags $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$VERSION"

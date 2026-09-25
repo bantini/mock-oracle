@@ -2,6 +2,7 @@
   "name": "mock-oracle",
   "version": "0.1.0",
   "description": "In-memory Oracle stand-in for CI that node-oracledb can connect to",
+  "license": "MIT",
   "keywords": [
     "oracle",
     "oracledb",

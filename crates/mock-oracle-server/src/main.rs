@@ -29,9 +29,25 @@ async fn main() -> std::io::Result<()> {
     let server = Server::start(addr, db, Config { password }).await?;
     tracing::info!(addr = %server.local_addr(), "mock-oracle listening");
 
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await?;
     server.stop().await;
     Ok(())
+}
+
+/// Waits for Ctrl-C, or SIGTERM from `docker stop`. As PID 1 in a container the
+/// process gets no default SIGTERM handler, so without this `docker stop` would
+/// wait out its timeout and then kill it.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r,
+            _ = term.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 /// SQL files to run at startup: `MOCK_ORACLE_SEED` (a file, or a directory whose

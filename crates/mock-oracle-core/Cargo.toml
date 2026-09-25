@@ -8,4 +8,5 @@ repository.workspace = true
 
 [dependencies]
 bigdecimal = "0.4"
+chrono = "0.4.45"
 thiserror.workspace = true

@@ -4,7 +4,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 
-use mock_oracle_core::{Column, Database, OraError, SqlType, Value};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Timelike};
+use mock_oracle_core::{Column, Database, OraError, Session as DbSession, SqlType, Value};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::auth::{self, Challenge, LoginError};
@@ -42,12 +43,22 @@ const FUNC_PING: u8 = 147;
 const EXEC_BIND: u32 = 0x08;
 const EXEC_DEFINE: u32 = 0x10;
 const EXEC_FETCH: u32 = 0x40;
+const EXEC_COMMIT: u32 = 0x100;
+/// Re-execute flag 2: commit on success.
+const EXEC_COMMIT_REEXECUTE: u32 = 0x1;
+
+/// End-of-call status flag telling the client a transaction is open.
+const CALL_STATUS_TXN_IN_PROGRESS: u32 = 0x02;
 
 // Oracle wire data types.
 const TYPE_VARCHAR: u8 = 1;
 const TYPE_NUMBER: u8 = 2;
 const TYPE_BINARY_INTEGER: u8 = 3;
+const TYPE_DATE: u8 = 12;
 const TYPE_CHAR: u8 = 96;
+const TYPE_TIMESTAMP: u8 = 180;
+const TYPE_TIMESTAMP_TZ: u8 = 181;
+const TYPE_TIMESTAMP_LTZ: u8 = 231;
 
 const CHARSET_UTF8: u16 = 873;
 const CHARSET_UTF16: u16 = 2000;
@@ -70,6 +81,8 @@ pub struct Session<S> {
     sdu: usize,
     service_name: String,
     login: LoginState,
+    /// The database session, once logged in.
+    db_session: Option<DbSession>,
     cursors: HashMap<u32, Cursor>,
     next_cursor_id: u32,
 }
@@ -97,6 +110,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             sdu: 8192,
             service_name: String::new(),
             login: LoginState::None,
+            db_session: None,
             cursors: HashMap::new(),
             next_cursor_id: 1,
         }
@@ -210,8 +224,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             // stream in sync.
             tracing::warn!(error = %e, "could not process request");
             out = WriteBuf::new();
+            let status = self.call_status();
             write_error(
                 &mut out,
+                status,
                 0,
                 0,
                 Some(&OraError::new(
@@ -252,7 +268,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             FUNC_AUTH_PHASE_ONE => self.auth_phase_one(r, out),
             FUNC_AUTH_PHASE_TWO => self.auth_phase_two(r, out),
             _ if !logged_in => {
-                write_error(out, 0, 0, Some(&OraError::new(1012, "not logged on")));
+                write_error(out, 0, 0, 0, Some(&OraError::new(1012, "not logged on")));
                 Ok(())
             }
             FUNC_EXECUTE => self.execute(r, out),
@@ -263,8 +279,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                 self.send_rows(cursor_id, array_size, out);
                 Ok(())
             }
-            FUNC_COMMIT | FUNC_ROLLBACK | FUNC_PING | FUNC_LOGOFF => {
-                write_status(out);
+            FUNC_COMMIT => {
+                match self.db().commit() {
+                    Ok(()) => write_status(out, self.call_status()),
+                    Err(e) => write_error(out, self.call_status(), 0, 0, Some(&e)),
+                }
+                Ok(())
+            }
+            FUNC_ROLLBACK | FUNC_LOGOFF => {
+                self.db().rollback();
+                write_status(out, 0);
+                Ok(())
+            }
+            FUNC_PING => {
+                write_status(out, self.call_status());
                 Ok(())
             }
             other => Err(invalid(format!("unsupported function {other}"))),
@@ -281,7 +309,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         out.key_value("AUTH_PBKDF2_CSK_SALT", &reply.csk_salt, 0);
         out.key_value("AUTH_PBKDF2_VGEN_COUNT", &reply.vgen_count, 0);
         out.key_value("AUTH_PBKDF2_SDER_COUNT", &reply.sder_count, 0);
-        write_status(out);
+        write_status(out, 0);
         self.login = LoginState::Challenged { user, challenge };
         Ok(())
     }
@@ -293,6 +321,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         else {
             write_error(
                 out,
+                0,
                 0,
                 0,
                 Some(&OraError::new(
@@ -313,6 +342,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                 tracing::info!(%user, "login refused: wrong password");
                 write_error(
                     out,
+                    0,
                     0,
                     0,
                     Some(&OraError::new(
@@ -346,8 +376,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         for (k, v) in params {
             out.key_value(k, v, 0);
         }
-        write_status(out);
+        write_status(out, 0);
         self.login = LoginState::LoggedIn;
+        let mut session = self.db.session(&user);
+        // The client sets its time zone during login so dates round-trip in local time.
+        if let Some(stmt) = pairs.get("AUTH_ALTER_SESSION") {
+            let stmt = stmt.trim_end_matches('\0');
+            if let Err(e) = session.execute(stmt, &[]) {
+                tracing::warn!(%stmt, error = %e, "ignoring login ALTER SESSION");
+            }
+        }
+        self.db_session = Some(session);
         Ok(())
     }
 
@@ -395,17 +434,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         } else {
             String::new()
         };
-        for _ in 0..13 {
-            r.ub4()?; // al8i4
+        let mut al8i4 = [0u32; 13];
+        for v in &mut al8i4 {
+            *v = r.ub4()?;
         }
         if options & EXEC_DEFINE != 0 && num_defines > 0 {
             return Err(invalid("column defines are not supported yet".into()));
         }
         let mut bind_types = Vec::new();
-        let mut binds = Vec::new();
+        let mut bind_rows = Vec::new();
+        let tz = self.db().time_zone_offset();
         if options & EXEC_BIND != 0 && num_binds > 0 {
             bind_types = read_bind_metadata(r, num_binds)?;
-            binds = read_bind_row(r, &bind_types)?;
+            // executeMany sends one row of binds per execution.
+            while r.remaining() > 0 {
+                bind_rows.push(read_bind_row(r, &bind_types, tz)?);
+            }
         }
 
         let (cursor_id, sql) = if has_sql {
@@ -414,7 +458,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             match self.cursors.get(&cursor_id) {
                 Some(c) => (cursor_id, c.sql.clone()),
                 None => {
-                    write_error(out, 0, 0, Some(&OraError::new(1001, "invalid cursor")));
+                    write_error(
+                        out,
+                        self.call_status(),
+                        0,
+                        0,
+                        Some(&OraError::new(1001, "invalid cursor")),
+                    );
                     return Ok(());
                 }
             }
@@ -424,7 +474,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         } else {
             0
         };
-        self.run_statement(cursor_id, sql, bind_types, &binds, fetch, out);
+        let commit = options & EXEC_COMMIT != 0;
+        // al8i4[1] is the execution count for DML (executeMany without binds); al8i4[7] marks a query.
+        let executions = if al8i4[7] == 1 { 1 } else { al8i4[1] };
+        self.run_statement(
+            cursor_id, sql, bind_types, bind_rows, executions, fetch, commit, out,
+        );
         Ok(())
     }
 
@@ -432,41 +487,94 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         let cursor_id = r.ub4()?;
         let num_iters = r.ub4()?;
         let flags1 = r.ub4()?;
-        r.ub4()?;
+        let flags2 = r.ub4()?;
         let Some(cursor) = self.cursors.get(&cursor_id) else {
-            write_error(out, 0, 0, Some(&OraError::new(1001, "invalid cursor")));
+            write_error(
+                out,
+                self.call_status(),
+                0,
+                0,
+                Some(&OraError::new(1001, "invalid cursor")),
+            );
             return Ok(());
         };
         let (sql, bind_types) = (cursor.sql.clone(), cursor.bind_types.clone());
-        let binds = if r.remaining() > 0 && !bind_types.is_empty() {
-            read_bind_row(r, &bind_types)?
+        // For DML the iteration count is the number of executions; queries run once.
+        let executions = if cursor.columns.is_empty() {
+            num_iters
         } else {
-            Vec::new()
+            1
         };
+        let tz = self.db().time_zone_offset();
+        let mut bind_rows = Vec::new();
+        if !bind_types.is_empty() {
+            while r.remaining() > 0 {
+                bind_rows.push(read_bind_row(r, &bind_types, tz)?);
+            }
+        }
         let fetch = if flags1 & 0x20 != 0 { num_iters } else { 0 };
-        self.run_statement(cursor_id, sql, bind_types, &binds, fetch, out);
+        let commit = flags2 & EXEC_COMMIT_REEXECUTE != 0;
+        self.run_statement(
+            cursor_id, sql, bind_types, bind_rows, executions, fetch, commit, out,
+        );
         Ok(())
     }
 
-    /// Executes `sql` and writes the describe info, the first `fetch` rows and
-    /// the closing error/status message.
+    fn db(&mut self) -> &mut DbSession {
+        self.db_session.as_mut().expect("logged in")
+    }
+
+    /// The end-of-call status: whether a transaction is open.
+    fn call_status(&self) -> u32 {
+        match &self.db_session {
+            Some(s) if s.in_transaction() => CALL_STATUS_TXN_IN_PROGRESS,
+            _ => 0,
+        }
+    }
+
+    /// Executes `sql` once per bind row (or `executions` times without binds) and writes the describe info, the first
+    /// `fetch` rows and the closing error/status message.
+    #[allow(clippy::too_many_arguments)]
     fn run_statement(
         &mut self,
         cursor_id: u32,
         sql: String,
         bind_types: Vec<u8>,
-        binds: &[Value],
+        bind_rows: Vec<Vec<Value>>,
+        executions: u32,
         fetch: u32,
+        commit: bool,
         out: &mut WriteBuf,
     ) {
-        tracing::debug!(%sql, ?binds, "execute");
-        let result = match self.db.execute(&sql, binds) {
-            Ok(result) => result,
-            Err(e) => {
-                write_error(out, cursor_id as u16, 0, Some(&e));
+        tracing::debug!(%sql, "execute");
+        let runs = if bind_rows.is_empty() {
+            executions.max(1) as usize
+        } else {
+            bind_rows.len()
+        };
+        let mut result = None;
+        let mut rows_affected = 0;
+        for i in 0..runs {
+            let binds = bind_rows.get(i).map_or(&[][..], Vec::as_slice);
+            match self.db().execute(&sql, binds) {
+                Ok(r) => {
+                    rows_affected += r.rows_affected;
+                    result = Some(r);
+                }
+                Err(e) => {
+                    let status = self.call_status();
+                    write_error(out, status, cursor_id as u16, rows_affected, Some(&e));
+                    return;
+                }
+            }
+        }
+        if commit {
+            if let Err(e) = self.db().commit() {
+                write_error(out, 0, cursor_id as u16, rows_affected, Some(&e));
                 return;
             }
-        };
+        }
+        let result = result.expect("at least one execution");
         let cursor_id = if cursor_id == 0 {
             self.next_cursor_id += 1;
             self.next_cursor_id - 1
@@ -489,15 +597,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         if result.is_query {
             self.send_rows(cursor_id, fetch, out);
         } else {
-            write_error(out, cursor_id as u16, result.rows_affected, None);
+            let status = self.call_status();
+            write_error(out, status, cursor_id as u16, rows_affected, None);
         }
     }
 
     /// Writes up to `max` pending rows of a cursor, then the end-of-call message:
     /// ORA-01403 when the cursor is exhausted, success otherwise.
     fn send_rows(&mut self, cursor_id: u32, max: u32, out: &mut WriteBuf) {
+        let status = self.call_status();
         let Some(cursor) = self.cursors.get_mut(&cursor_id) else {
-            write_error(out, 0, 0, Some(&OraError::new(1001, "invalid cursor")));
+            write_error(
+                out,
+                status,
+                0,
+                0,
+                Some(&OraError::new(1001, "invalid cursor")),
+            );
             return;
         };
         let n = (max as usize).min(cursor.pending.len());
@@ -522,12 +638,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         if cursor.pending.is_empty() {
             write_error(
                 out,
+                status,
                 cursor_id as u16,
                 fetched,
                 Some(&OraError::new(ORA_NO_DATA_FOUND, "no data found")),
             );
         } else {
-            write_error(out, cursor_id as u16, fetched, None);
+            write_error(out, status, cursor_id as u16, fetched, None);
         }
     }
 }
@@ -577,7 +694,9 @@ fn read_bind_metadata(r: &mut ReadBuf, n: u32) -> io::Result<Vec<u8>> {
     Ok(types)
 }
 
-fn read_bind_row(r: &mut ReadBuf, types: &[u8]) -> io::Result<Vec<Value>> {
+/// Reads one row of bind values. `tz_offset_minutes` is the session time zone, used to
+/// turn time-zone-aware binds (UTC on the wire) into local date/times.
+fn read_bind_row(r: &mut ReadBuf, types: &[u8], tz_offset_minutes: i32) -> io::Result<Vec<Value>> {
     if r.u8()? != MSG_ROW_DATA {
         return Err(invalid("expected bind row".into()));
     }
@@ -593,12 +712,66 @@ fn read_bind_row(r: &mut ReadBuf, types: &[u8]) -> io::Result<Vec<Value>> {
                 (TYPE_NUMBER | TYPE_BINARY_INTEGER, Some(b)) => {
                     Ok(Value::parse_number(&oranum::decode(&b)).unwrap_or(Value::Null))
                 }
+                (TYPE_DATE, Some(b)) => Ok(Value::Date(decode_date(&b)?)),
+                (TYPE_TIMESTAMP, Some(b)) => Ok(Value::Timestamp(decode_date(&b)?)),
+                (TYPE_TIMESTAMP_LTZ | TYPE_TIMESTAMP_TZ, Some(b)) => {
+                    let utc = decode_date(&b)?;
+                    let local = utc + Duration::minutes(tz_offset_minutes as i64);
+                    // Without fractional seconds the client sends the short DATE form.
+                    Ok(if b.len() <= 7 {
+                        Value::Date(local)
+                    } else {
+                        Value::Timestamp(local)
+                    })
+                }
                 (other, _) => Err(invalid(format!(
                     "binding type {other} is not supported yet"
                 ))),
             }
         })
         .collect()
+}
+
+/// Decodes Oracle's 7-byte DATE or 11-byte TIMESTAMP wire format.
+fn decode_date(b: &[u8]) -> io::Result<NaiveDateTime> {
+    if b.len() < 7 {
+        return Err(invalid("short date value".into()));
+    }
+    let year = (b[0] as i32 - 100) * 100 + b[1] as i32 - 100;
+    let nanos = if b.len() >= 11 {
+        u32::from_be_bytes([b[7], b[8], b[9], b[10]])
+    } else {
+        0
+    };
+    // Time bytes are stored plus one, so zero is never valid.
+    let (Some(hour), Some(minute), Some(second)) = (
+        b[4].checked_sub(1),
+        b[5].checked_sub(1),
+        b[6].checked_sub(1),
+    ) else {
+        return Err(invalid("invalid date value".into()));
+    };
+    NaiveDate::from_ymd_opt(year, b[2] as u32, b[3] as u32)
+        .and_then(|d| d.and_hms_nano_opt(hour as u32, minute as u32, second as u32, nanos))
+        .ok_or_else(|| invalid("invalid date value".into()))
+}
+
+/// Encodes a date/time as a 7-byte DATE, or an 11-byte TIMESTAMP when it has fractional seconds.
+fn encode_date(d: &NaiveDateTime, with_fraction: bool) -> Vec<u8> {
+    let year = d.year();
+    let mut b = vec![
+        (year / 100 + 100) as u8,
+        (year % 100 + 100) as u8,
+        d.month() as u8,
+        d.day() as u8,
+        d.hour() as u8 + 1,
+        d.minute() as u8 + 1,
+        d.second() as u8 + 1,
+    ];
+    if with_fraction && d.nanosecond() != 0 {
+        b.extend_from_slice(&d.nanosecond().to_be_bytes());
+    }
+    b
 }
 
 fn write_protocol(out: &mut WriteBuf) {
@@ -622,9 +795,9 @@ fn write_protocol(out: &mut WriteBuf) {
     out.bytes_with_length(&runtime_caps);
 }
 
-fn write_status(out: &mut WriteBuf) {
+fn write_status(out: &mut WriteBuf, call_status: u32) {
     out.u8(MSG_STATUS);
-    out.ub4(0); // call status
+    out.ub4(call_status);
     out.ub2(0); // end-to-end sequence number
 }
 
@@ -638,13 +811,16 @@ fn write_describe(out: &mut WriteBuf, columns: &[Column]) {
     }
     for (i, c) in columns.iter().enumerate() {
         let (ora_type, precision, scale, charset, csfrm) = match c.sql_type {
-            SqlType::Number => (TYPE_NUMBER, 0i8, -127i8, 0, 0),
+            SqlType::Number { precision, scale } => (TYPE_NUMBER, precision, scale, 0, 0),
             SqlType::Varchar2(_) => (TYPE_VARCHAR, 0, 0, CHARSET_UTF8, 1),
+            SqlType::Char(_) => (TYPE_CHAR, 0, 0, CHARSET_UTF8, 1),
+            SqlType::Date => (TYPE_DATE, 0, 0, 0, 0),
+            SqlType::Timestamp(p) => (TYPE_TIMESTAMP, 0, p as i8, 0, 0),
         };
         let size = max_size(c.sql_type);
         out.u8(ora_type);
         out.u8(0); // flags
-        out.u8(precision as u8);
+        out.u8(precision);
         out.u8(scale as u8);
         out.ub4(size); // max size in bytes
         out.ub4(0); // max array elements
@@ -653,10 +829,9 @@ fn write_describe(out: &mut WriteBuf, columns: &[Column]) {
         out.ub2(0); // version
         out.ub2(charset);
         out.u8(csfrm);
-        out.ub4(if let SqlType::Varchar2(n) = c.sql_type {
-            n
-        } else {
-            0
+        out.ub4(match c.sql_type {
+            SqlType::Varchar2(n) | SqlType::Char(n) => n,
+            _ => 0,
         }); // size in chars
         out.ub4(0); // oaccolid
         out.u8(1); // nullable
@@ -677,8 +852,10 @@ fn write_describe(out: &mut WriteBuf, columns: &[Column]) {
 
 fn max_size(t: SqlType) -> u32 {
     match t {
-        SqlType::Number => 22,
-        SqlType::Varchar2(n) => n,
+        SqlType::Number { .. } => 22,
+        SqlType::Varchar2(n) | SqlType::Char(n) => n,
+        SqlType::Date => 7,
+        SqlType::Timestamp(_) => 11,
     }
 }
 
@@ -687,19 +864,28 @@ fn write_value(out: &mut WriteBuf, value: &Value, sql_type: SqlType) {
         // A zero-length column carries no bytes at all; the client knows it is NULL.
         (SqlType::Varchar2(0), _) => {}
         (_, Value::Null) => out.u8(0),
-        (SqlType::Number, v) => match oranum::encode_value(v) {
+        (SqlType::Number { .. }, v) => match oranum::encode_value(v) {
             Some(bytes) => out.bytes_with_length(&bytes),
             None => out.u8(0),
         },
-        (SqlType::Varchar2(_), v) => out.bytes_with_length(v.to_string().as_bytes()),
+        (SqlType::Date | SqlType::Timestamp(_), Value::Date(d) | Value::Timestamp(d)) => {
+            out.bytes_with_length(&encode_date(d, matches!(sql_type, SqlType::Timestamp(_))))
+        }
+        (_, v) => out.bytes_with_length(v.to_string().as_bytes()),
     }
 }
 
 /// Writes the end-of-call ERROR message. `error: None` means success.
-fn write_error(out: &mut WriteBuf, cursor_id: u16, row_count: u64, error: Option<&OraError>) {
+fn write_error(
+    out: &mut WriteBuf,
+    call_status: u32,
+    cursor_id: u16,
+    row_count: u64,
+    error: Option<&OraError>,
+) {
     let code = error.map_or(0, |e| e.code);
     out.u8(MSG_ERROR);
-    out.ub4(0); // call status
+    out.ub4(call_status);
     out.ub2(0); // end-to-end sequence number
     out.ub4(0); // current row number
     out.ub2(code.min(u16::MAX as u32) as u16);

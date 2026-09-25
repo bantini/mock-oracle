@@ -15,4 +15,23 @@ impl OraError {
             message: message.into(),
         }
     }
+
+    pub fn inconsistent(expected: &str, got: &str) -> Self {
+        Self::new(
+            932,
+            format!("inconsistent datatypes: expected {expected} got {got}"),
+        )
+    }
+
+    pub fn table_not_found() -> Self {
+        Self::new(942, "table or view does not exist")
+    }
+
+    pub fn invalid_identifier(name: &str) -> Self {
+        Self::new(904, format!("{name}: invalid identifier"))
+    }
+
+    pub fn missing_expression() -> Self {
+        Self::new(936, "missing expression")
+    }
 }

@@ -310,6 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { MockOracle } = nativeBinding
+const { Snapshot, MockOracle } = nativeBinding
 
+module.exports.Snapshot = Snapshot
 module.exports.MockOracle = MockOracle

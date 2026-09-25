@@ -8,9 +8,26 @@ export interface StartOptions {
   port?: number
   /** Password for every user; defaults to "oracle". */
   password?: string
+  /**
+   * SQL run before the first connection, for example CREATE TABLE and INSERT
+   * statements. Statements are separated by `;` or a line holding only `/`.
+   */
+  seed?: string
 }
+/** A saved copy of every table, from [`MockOracle::snapshot`]. */
+export declare class Snapshot { }
 export declare class MockOracle {
   static start(options?: StartOptions | undefined | null): Promise<MockOracle>
   get connectString(): string
+  /** Runs SQL statements (separated by `;` or `/`) and commits them. */
+  runScript(sql: string): void
+  /** Captures the committed contents of every table. */
+  snapshot(): Snapshot
+  /**
+   * Puts every table back as it was in `snapshot`, or as it was right after
+   * start (and seeding) when no snapshot is given. Uncommitted work in open
+   * connections is not discarded.
+   */
+  restore(snapshot?: Snapshot | undefined | null): void
   stop(): Promise<void>
 }

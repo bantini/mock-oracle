@@ -10,6 +10,7 @@ mod eval;
 mod functions;
 mod lexer;
 mod parser;
+mod plsql;
 mod session;
 mod value;
 
@@ -39,6 +40,36 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
     /// Rows inserted, updated or deleted by a DML statement.
     pub rows_affected: u64,
+    /// One entry per bind position, set for PL/SQL blocks and DML with RETURNING.
+    /// Empty for other statements.
+    pub out_binds: Vec<OutBind>,
+}
+
+/// How a statement uses a bind position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindDir {
+    /// A value read by the statement.
+    In,
+    /// A PL/SQL block's bind: read, and possibly assigned.
+    InOut,
+    /// A target of `RETURNING ... INTO`: no value is sent, one comes back per row.
+    Returning,
+}
+
+/// The value of a bind after a statement ran.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutBind {
+    /// An input-only bind: nothing comes back.
+    In,
+    /// The final value of a PL/SQL block's bind.
+    Value(Value),
+    /// The values a RETURNING clause produced, one per affected row.
+    Returning(Vec<Value>),
+}
+
+/// How each bind position of `sql` is used. Fails if the statement does not parse.
+pub fn bind_directions(sql: &str) -> Result<Vec<BindDir>, OraError> {
+    Ok(parser::parse(sql)?.bind_dirs)
 }
 
 /// A saved copy of a database's committed tables, for [`Database::restore`].
@@ -46,6 +77,7 @@ pub struct QueryResult {
 pub struct Snapshot {
     catalog: Catalog,
     identities: HashMap<String, i64>,
+    sequences: HashMap<String, i128>,
 }
 
 /// One in-memory database. Sessions share its committed state; each session sees
@@ -57,6 +89,9 @@ pub struct Database {
     next_constraint: AtomicU64,
     /// Next value of each table's identity column.
     identities: Mutex<HashMap<String, i64>>,
+    /// The next value NEXTVAL returns for each sequence. Like Oracle, sequences are not
+    /// transactional: a rollback does not give numbers back.
+    sequences: Mutex<HashMap<String, i128>>,
 }
 
 impl Default for Database {
@@ -66,6 +101,7 @@ impl Default for Database {
             next_row_id: AtomicU64::new(1),
             next_constraint: AtomicU64::new(10_000),
             identities: Mutex::new(HashMap::new()),
+            sequences: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -105,6 +141,7 @@ impl Database {
         Snapshot {
             catalog: self.committed(),
             identities: self.identities.lock().unwrap().clone(),
+            sequences: self.sequences.lock().unwrap().clone(),
         }
     }
 
@@ -116,13 +153,15 @@ impl Database {
         *state = snapshot.catalog.clone();
         state.version = version;
         *self.identities.lock().unwrap() = snapshot.identities.clone();
+        *self.sequences.lock().unwrap() = snapshot.sequences.clone();
     }
 
-    /// Drops every table.
+    /// Drops every table, sequence, procedure and function.
     pub fn reset(&self) {
         self.restore(&Snapshot {
             catalog: Catalog::default(),
             identities: HashMap::new(),
+            sequences: HashMap::new(),
         });
     }
 
@@ -140,6 +179,57 @@ impl Database {
         let v = *next;
         *next += 1;
         v
+    }
+
+    /// A stored procedure or function. Like all DDL, routines are visible to every
+    /// session at once, including sessions in the middle of a transaction.
+    fn routine(&self, name: &str) -> Option<Arc<plsql::Routine>> {
+        self.state.read().unwrap().routines.get(name).cloned()
+    }
+
+    fn sequence_def(&self, name: &str) -> Option<catalog::SequenceDef> {
+        self.state.read().unwrap().sequences.get(name).cloned()
+    }
+
+    /// The next value of a sequence.
+    fn next_sequence(&self, name: &str, def: &catalog::SequenceDef) -> Result<i128, OraError> {
+        let mut seqs = self.sequences.lock().unwrap();
+        let next = seqs.entry(name.to_string()).or_insert(def.start);
+        let mut v = *next;
+        if v > def.max || v < def.min {
+            if !def.cycle {
+                let limit = if def.increment > 0 {
+                    "MAXVALUE"
+                } else {
+                    "MINVALUE"
+                };
+                return Err(OraError::new(
+                    8004,
+                    format!("sequence {name}.NEXTVAL exceeds {limit} and cannot be instantiated"),
+                ));
+            }
+            v = if def.increment > 0 { def.min } else { def.max };
+        }
+        *next = v.saturating_add(def.increment);
+        Ok(v)
+    }
+
+    /// Sets where a sequence starts over, or forgets it so it starts at its START WITH.
+    fn set_sequence(&self, name: &str, next: Option<i128>) {
+        let mut seqs = self.sequences.lock().unwrap();
+        match next {
+            Some(n) => {
+                seqs.insert(name.to_string(), n);
+            }
+            None => {
+                seqs.remove(name);
+            }
+        }
+    }
+
+    /// The value the next NEXTVAL would return, if the sequence has been used.
+    fn peek_sequence(&self, name: &str) -> Option<i128> {
+        self.sequences.lock().unwrap().get(name).copied()
     }
 
     /// A system-generated constraint name such as `SYS_C0010001`.
@@ -160,8 +250,40 @@ fn abbreviate(sql: &str) -> String {
     }
 }
 
+/// Whether a statement starts a PL/SQL unit: a block, or CREATE of a procedure, function,
+/// package, trigger or type.
+fn is_plsql_unit(stmt: &str) -> bool {
+    let words: Vec<String> = stmt
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '<'))
+        .filter(|w| !w.is_empty())
+        .take(5)
+        .map(str::to_uppercase)
+        .collect();
+    let mut w = words.iter().map(String::as_str);
+    match w.next() {
+        Some("BEGIN" | "DECLARE") => true,
+        Some(first) if first.starts_with("<<") => true,
+        Some("CREATE") => {
+            let mut next = w.next();
+            if next == Some("OR") {
+                w.next();
+                next = w.next();
+            }
+            if matches!(next, Some("EDITIONABLE" | "NONEDITIONABLE")) {
+                next = w.next();
+            }
+            matches!(
+                next,
+                Some("PROCEDURE" | "FUNCTION" | "PACKAGE" | "TRIGGER" | "TYPE")
+            )
+        }
+        _ => false,
+    }
+}
+
 /// Splits a SQL script into statements on `;` or on a line holding only `/`,
-/// ignoring separators inside strings, quoted identifiers and comments.
+/// ignoring separators inside strings, quoted identifiers and comments. PL/SQL blocks,
+/// procedures and functions run to the next `/` line (or the end of the script).
 pub fn split_script(script: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -206,6 +328,8 @@ pub fn split_script(script: &str) -> Vec<String> {
                 }
                 current.push(' ');
             }
+            // PL/SQL units hold semicolons of their own and end at a `/` line.
+            ';' if is_plsql_unit(&current) => current.push(c),
             ';' => flush(&mut current, &mut out),
             // A line holding only `/` (and whitespace) ends a statement.
             '/' if at_line_start
@@ -233,3 +357,6 @@ pub fn split_script(script: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod plsql_tests;

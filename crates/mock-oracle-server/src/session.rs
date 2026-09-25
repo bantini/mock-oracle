@@ -5,7 +5,10 @@ use std::io;
 use std::sync::Arc;
 
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Timelike};
-use mock_oracle_core::{Column, Database, OraError, Session as DbSession, SqlType, Value};
+use mock_oracle_core::{
+    bind_directions, format_number, BindDir, Column, Database, OraError, OutBind,
+    Session as DbSession, SqlType, Value,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::auth::{self, Challenge, LoginError};
@@ -21,6 +24,7 @@ const MSG_FUNCTION: u8 = 3;
 const MSG_ERROR: u8 = 4;
 const MSG_ROW_HEADER: u8 = 6;
 const MSG_ROW_DATA: u8 = 7;
+const MSG_IO_VECTOR: u8 = 11;
 const MSG_PARAMETER: u8 = 8;
 const MSG_STATUS: u8 = 9;
 const MSG_DESCRIBE_INFO: u8 = 16;
@@ -59,6 +63,15 @@ const TYPE_CHAR: u8 = 96;
 const TYPE_TIMESTAMP: u8 = 180;
 const TYPE_TIMESTAMP_TZ: u8 = 181;
 const TYPE_TIMESTAMP_LTZ: u8 = 231;
+const TYPE_BOOLEAN: u8 = 252;
+
+// Bind directions reported in the IO vector.
+const BIND_DIR_OUTPUT: u8 = 16;
+const BIND_DIR_INPUT: u8 = 32;
+const BIND_DIR_INPUT_OUTPUT: u8 = 48;
+
+/// Length byte that starts a NULL PL/SQL BOOLEAN bind.
+const ESCAPE_CHAR: u8 = 253;
 
 const CHARSET_UTF8: u16 = 873;
 const CHARSET_UTF16: u16 = 2000;
@@ -93,9 +106,18 @@ enum LoginState {
     LoggedIn,
 }
 
+/// A bind position's type as the client described it.
+#[derive(Debug, Clone, Copy)]
+struct BindMeta {
+    ora_type: u8,
+    /// The most bytes the client accepts back for an OUT value.
+    max_size: u32,
+}
+
 struct Cursor {
     sql: String,
-    bind_types: Vec<u8>,
+    binds: Vec<BindMeta>,
+    bind_dirs: Vec<BindDir>,
     columns: Vec<Column>,
     pending: VecDeque<Vec<Value>>,
     fetched: u64,
@@ -441,17 +463,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         if options & EXEC_DEFINE != 0 && num_defines > 0 {
             return Err(invalid("column defines are not supported yet".into()));
         }
-        let mut bind_types = Vec::new();
-        let mut bind_rows = Vec::new();
-        let tz = self.db().time_zone_offset();
-        if options & EXEC_BIND != 0 && num_binds > 0 {
-            bind_types = read_bind_metadata(r, num_binds)?;
-            // executeMany sends one row of binds per execution.
-            while r.remaining() > 0 {
-                bind_rows.push(read_bind_row(r, &bind_types, tz)?);
-            }
-        }
-
         let (cursor_id, sql) = if has_sql {
             (0, sql)
         } else {
@@ -469,6 +480,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                 }
             }
         };
+        // The client sends no values for RETURNING ... INTO binds.
+        let bind_dirs = bind_directions(&sql).unwrap_or_default();
+        let mut binds = Vec::new();
+        let mut bind_rows = Vec::new();
+        let tz = self.db().time_zone_offset();
+        if options & EXEC_BIND != 0 && num_binds > 0 {
+            binds = read_bind_metadata(r, num_binds)?;
+            // executeMany sends one row of binds per execution.
+            while r.remaining() > 0 {
+                bind_rows.push(read_bind_row(r, &binds, &bind_dirs, tz)?);
+            }
+            // When every bind is a RETURNING target the client sends no row at all.
+            if bind_rows.is_empty() && bind_dirs.iter().all(|d| *d == BindDir::Returning) {
+                bind_rows.push(vec![Value::Null; binds.len()]);
+            }
+        }
         let fetch = if options & EXEC_FETCH != 0 {
             num_iters
         } else {
@@ -478,7 +505,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         // al8i4[1] is the execution count for DML (executeMany without binds); al8i4[7] marks a query.
         let executions = if al8i4[7] == 1 { 1 } else { al8i4[1] };
         self.run_statement(
-            cursor_id, sql, bind_types, bind_rows, executions, fetch, commit, out,
+            cursor_id, sql, binds, bind_dirs, bind_rows, executions, fetch, commit, out,
         );
         Ok(())
     }
@@ -498,7 +525,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             );
             return Ok(());
         };
-        let (sql, bind_types) = (cursor.sql.clone(), cursor.bind_types.clone());
+        let (sql, binds, bind_dirs) = (
+            cursor.sql.clone(),
+            cursor.binds.clone(),
+            cursor.bind_dirs.clone(),
+        );
         // For DML the iteration count is the number of executions; queries run once.
         let executions = if cursor.columns.is_empty() {
             num_iters
@@ -507,15 +538,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         };
         let tz = self.db().time_zone_offset();
         let mut bind_rows = Vec::new();
-        if !bind_types.is_empty() {
+        if !binds.is_empty() {
             while r.remaining() > 0 {
-                bind_rows.push(read_bind_row(r, &bind_types, tz)?);
+                bind_rows.push(read_bind_row(r, &binds, &bind_dirs, tz)?);
+            }
+            // When every bind is a RETURNING target the client sends no row at all.
+            if bind_rows.is_empty() && bind_dirs.iter().all(|d| *d == BindDir::Returning) {
+                bind_rows.push(vec![Value::Null; binds.len()]);
             }
         }
         let fetch = if flags1 & 0x20 != 0 { num_iters } else { 0 };
         let commit = flags2 & EXEC_COMMIT_REEXECUTE != 0;
         self.run_statement(
-            cursor_id, sql, bind_types, bind_rows, executions, fetch, commit, out,
+            cursor_id, sql, binds, bind_dirs, bind_rows, executions, fetch, commit, out,
         );
         Ok(())
     }
@@ -539,7 +574,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         &mut self,
         cursor_id: u32,
         sql: String,
-        bind_types: Vec<u8>,
+        binds: Vec<BindMeta>,
+        bind_dirs: Vec<BindDir>,
         bind_rows: Vec<Vec<Value>>,
         executions: u32,
         fetch: u32,
@@ -554,11 +590,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         };
         let mut result = None;
         let mut rows_affected = 0;
+        // OUT bind values of each execution, for PL/SQL and RETURNING INTO.
+        let mut out_rows = Vec::new();
+        let tz = self.db().time_zone_offset();
         for i in 0..runs {
-            let binds = bind_rows.get(i).map_or(&[][..], Vec::as_slice);
-            match self.db().execute(&sql, binds) {
-                Ok(r) => {
+            let values = bind_rows.get(i).map_or(&[][..], Vec::as_slice);
+            match self.db().execute(&sql, values) {
+                Ok(mut r) => {
                     rows_affected += r.rows_affected;
+                    if !r.out_binds.is_empty() {
+                        let mut row = WriteBuf::new();
+                        if let Err(e) = write_out_binds(&mut row, &r.out_binds, &binds, values, tz)
+                        {
+                            let status = self.call_status();
+                            write_error(out, status, cursor_id as u16, rows_affected, Some(&e));
+                            return;
+                        }
+                        out_rows.push((std::mem::take(&mut r.out_binds), row));
+                    }
                     result = Some(r);
                 }
                 Err(e) => {
@@ -584,11 +633,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         if result.is_query {
             write_describe(out, &result.columns);
         }
+        if let Some((first, _)) = out_rows.first() {
+            write_io_vector(out, first, out_rows.len() as u32);
+            for (_, row) in &out_rows {
+                out.raw(&row.buf);
+            }
+        }
         self.cursors.insert(
             cursor_id,
             Cursor {
                 sql,
-                bind_types,
+                binds,
+                bind_dirs,
                 columns: result.columns,
                 pending: result.rows.into(),
                 fetched: 0,
@@ -670,14 +726,14 @@ fn read_auth(r: &mut ReadBuf) -> io::Result<(String, HashMap<String, String>)> {
     Ok((user, pairs))
 }
 
-fn read_bind_metadata(r: &mut ReadBuf, n: u32) -> io::Result<Vec<u8>> {
+fn read_bind_metadata(r: &mut ReadBuf, n: u32) -> io::Result<Vec<BindMeta>> {
     let mut types = Vec::with_capacity(n as usize);
     for _ in 0..n {
         let ora_type = r.u8()?;
         r.u8()?; // flags
         r.u8()?;
         r.u8()?;
-        r.ub4()?; // max size
+        let max_size = r.ub4()?;
         r.ub4()?; // max array elements
         r.ub4()?; // cont flags
         let oid_len = r.ub4()?;
@@ -689,20 +745,34 @@ fn read_bind_metadata(r: &mut ReadBuf, n: u32) -> io::Result<Vec<u8>> {
         r.u8()?; // charset form
         r.ub4()?; // LOB prefetch length
         r.ub4()?; // oaccolid
-        types.push(ora_type);
+        types.push(BindMeta { ora_type, max_size });
     }
     Ok(types)
 }
 
 /// Reads one row of bind values. `tz_offset_minutes` is the session time zone, used to
 /// turn time-zone-aware binds (UTC on the wire) into local date/times.
-fn read_bind_row(r: &mut ReadBuf, types: &[u8], tz_offset_minutes: i32) -> io::Result<Vec<Value>> {
+/// Positions whose direction is RETURNING carry no value and read as NULL.
+fn read_bind_row(
+    r: &mut ReadBuf,
+    binds: &[BindMeta],
+    dirs: &[BindDir],
+    tz_offset_minutes: i32,
+) -> io::Result<Vec<Value>> {
     if r.u8()? != MSG_ROW_DATA {
         return Err(invalid("expected bind row".into()));
     }
-    types
+    binds
         .iter()
-        .map(|&t| {
+        .enumerate()
+        .map(|(i, b)| {
+            if dirs.get(i) == Some(&BindDir::Returning) {
+                return Ok(Value::Null);
+            }
+            let t = b.ora_type;
+            if t == TYPE_BOOLEAN {
+                return read_boolean(r);
+            }
             let bytes = r.bytes_with_length()?;
             match (t, bytes) {
                 (_, None) => Ok(Value::Null),
@@ -730,6 +800,145 @@ fn read_bind_row(r: &mut ReadBuf, types: &[u8], tz_offset_minutes: i32) -> io::R
             }
         })
         .collect()
+}
+
+/// Reads a PL/SQL BOOLEAN bind: `[1, 1]` for TRUE, `[0]` for FALSE, and an escape
+/// sequence for NULL.
+fn read_boolean(r: &mut ReadBuf) -> io::Result<Value> {
+    let len = r.u8()?;
+    if len == ESCAPE_CHAR {
+        r.u8()?;
+        return Ok(Value::Null);
+    }
+    if len == 0 {
+        return Ok(Value::Null);
+    }
+    let b = r.bytes(len as usize)?;
+    Ok(Value::Boolean(b[0] == 1))
+}
+
+/// Writes the IO vector that tells the client which binds come back.
+fn write_io_vector(out: &mut WriteBuf, binds: &[OutBind], iterations: u32) {
+    let n = binds.len() as u32;
+    out.u8(MSG_IO_VECTOR);
+    out.u8(0); // flag
+    out.ub2((n % 256) as u16); // number of requests
+    out.ub4(n / 256); // iteration number
+    out.ub4(iterations);
+    out.ub2(0); // uac buffer length
+    out.ub2(0); // bit vector
+    out.ub2(0); // rowid
+    for b in binds {
+        out.u8(match b {
+            OutBind::In => BIND_DIR_INPUT,
+            OutBind::Value(_) => BIND_DIR_INPUT_OUTPUT,
+            OutBind::Returning(_) => BIND_DIR_OUTPUT,
+        });
+    }
+}
+
+/// Writes one execution's OUT bind values as a ROW_DATA message.
+fn write_out_binds(
+    out: &mut WriteBuf,
+    values: &[OutBind],
+    binds: &[BindMeta],
+    inputs: &[Value],
+    tz_offset_minutes: i32,
+) -> Result<(), OraError> {
+    out.u8(MSG_ROW_DATA);
+    for (i, v) in values.iter().enumerate() {
+        let meta = binds.get(i).copied().unwrap_or(BindMeta {
+            ora_type: TYPE_VARCHAR,
+            max_size: 32767,
+        });
+        match v {
+            OutBind::In => {}
+            OutBind::Value(v) => {
+                // Values the block did not change always fit where they came from.
+                let changed = inputs.get(i) != Some(v);
+                write_out_value(out, v, meta, changed, tz_offset_minutes)?;
+            }
+            OutBind::Returning(rows) => {
+                out.ub4(rows.len() as u32);
+                for v in rows {
+                    write_out_value(out, v, meta, true, tz_offset_minutes)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes an OUT value converted to the bind's type, followed by its indicator.
+fn write_out_value(
+    out: &mut WriteBuf,
+    v: &Value,
+    meta: BindMeta,
+    check_size: bool,
+    tz_offset_minutes: i32,
+) -> Result<(), OraError> {
+    let value_error =
+        |detail: &str| OraError::new(6502, format!("PL/SQL: numeric or value error{detail}"));
+    let bytes: Option<Vec<u8>> = match (meta.ora_type, v) {
+        (_, Value::Null) => None,
+        (TYPE_NUMBER | TYPE_BINARY_INTEGER, v) => {
+            let n = match v {
+                Value::Number(_) => v.clone(),
+                Value::Varchar2(s) => Value::parse_number(s.trim())
+                    .ok_or_else(|| value_error(": character to number conversion error"))?,
+                Value::Boolean(b) => Value::number(*b as i64),
+                _ => return Err(value_error("")),
+            };
+            oranum::encode_value(&n)
+        }
+        (TYPE_DATE | TYPE_TIMESTAMP, Value::Date(d) | Value::Timestamp(d)) => {
+            Some(encode_date(d, meta.ora_type == TYPE_TIMESTAMP))
+        }
+        (TYPE_TIMESTAMP_LTZ | TYPE_TIMESTAMP_TZ, Value::Date(d) | Value::Timestamp(d)) => {
+            let utc = *d - Duration::minutes(tz_offset_minutes as i64);
+            Some(encode_date(&utc, true))
+        }
+        (TYPE_DATE | TYPE_TIMESTAMP | TYPE_TIMESTAMP_LTZ | TYPE_TIMESTAMP_TZ, v) => {
+            let got = match v {
+                Value::Number(_) => "NUMBER",
+                Value::Boolean(_) => "BOOLEAN",
+                _ => "CHAR",
+            };
+            return Err(OraError::new(
+                932,
+                format!("inconsistent datatypes: expected DATE got {got}"),
+            ));
+        }
+        (TYPE_BOOLEAN, v) => match v {
+            Value::Boolean(true) => Some(vec![1, 1]),
+            Value::Boolean(false) => Some(vec![0]),
+            _ => {
+                return Err(OraError::new(
+                    6550,
+                    "PLS-00382: expression is of wrong type",
+                ))
+            }
+        },
+        (_, v) => {
+            let text = match v {
+                Value::Number(n) => format_number(n),
+                v => v.to_string(),
+            };
+            if check_size && text.len() > meta.max_size as usize {
+                return Err(value_error(": character string buffer too small"));
+            }
+            Some(text.into_bytes())
+        }
+    };
+    // A bind with no room gets no value bytes at all; the client reads it as NULL.
+    if meta.max_size > 0 || meta.ora_type == TYPE_BOOLEAN {
+        match bytes {
+            Some(b) => out.bytes_with_length(&b),
+            None => out.u8(0),
+        }
+    }
+    out.ub4(0); // indicator: the full value was sent
+    Ok(())
 }
 
 /// Decodes Oracle's 7-byte DATE or 11-byte TIMESTAMP wire format.

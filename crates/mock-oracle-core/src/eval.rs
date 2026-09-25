@@ -1,5 +1,6 @@
 //! Query and expression evaluation over a [`Catalog`].
 
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -8,8 +9,9 @@ use chrono::{Datelike, Duration, NaiveDateTime};
 
 use crate::ast::*;
 use crate::catalog::Catalog;
+use crate::plsql::exec::Output;
 use crate::value::{compare, key_string};
-use crate::{datetime, OraError, SqlType, Value};
+use crate::{datetime, Database, OraError, SqlType, Value};
 
 /// Per-session settings that affect evaluation.
 #[derive(Debug, Clone)]
@@ -22,6 +24,12 @@ pub struct Env {
     /// When the current statement started, in UTC and in the server's local time.
     pub now_utc: NaiveDateTime,
     pub now_local: NaiveDateTime,
+    /// The last NEXTVAL of each sequence in this session, for CURRVAL.
+    pub currval: RefCell<HashMap<String, i128>>,
+    /// DBMS_OUTPUT's buffer.
+    pub output: RefCell<Output>,
+    /// How deeply PL/SQL calls are nested.
+    pub depth: Cell<u32>,
 }
 
 impl Env {
@@ -34,6 +42,9 @@ impl Env {
             tz_offset_minutes: now.offset().local_minus_utc() / 60,
             now_utc: now.naive_utc(),
             now_local: now.naive_local(),
+            currval: RefCell::new(HashMap::new()),
+            output: RefCell::new(Output::default()),
+            depth: Cell::new(0),
         }
     }
 
@@ -99,6 +110,15 @@ pub struct Ex<'a> {
     pub cat: &'a Catalog,
     pub binds: &'a [Value],
     pub env: &'a Env,
+    pub db: &'a Database,
+    /// PL/SQL variables, when running inside a block. Column names win over them.
+    pub vars: Option<&'a dyn VarLookup>,
+}
+
+/// Names a SQL statement inside PL/SQL can see besides columns: variables, record
+/// fields (`rec.field`), and attributes such as `SQL%ROWCOUNT` (qualifier `SQL%`).
+pub trait VarLookup {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Option<Value>;
 }
 
 const AGGREGATES: &[&str] = &[
@@ -116,7 +136,11 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         Expr::Function { name, args, .. } => {
             is_aggregate(name) || args.iter().any(contains_aggregate)
         }
-        Expr::Literal(_) | Expr::Bind(_) | Expr::Column { .. } | Expr::RowNum => false,
+        Expr::Literal(_)
+        | Expr::Bind(_)
+        | Expr::Column { .. }
+        | Expr::RowNum
+        | Expr::Sequence { .. } => false,
         Expr::Subquery(_) | Expr::Exists(_) => false,
         Expr::Neg(a) | Expr::Not(a) => contains_aggregate(a),
         Expr::Binary(_, a, b) => contains_aggregate(a) || contains_aggregate(b),
@@ -791,6 +815,29 @@ impl Ex<'_> {
 
     // ---- expressions ----
 
+    fn sequence(&self, name: &str, next: bool) -> Result<Value, OraError> {
+        let short = name.rsplit('.').next().unwrap_or(name);
+        let Some(def) = self.db.sequence_def(short) else {
+            return Err(OraError::new(2289, "sequence does not exist"));
+        };
+        let v = if next {
+            let v = self.db.next_sequence(short, &def)?;
+            self.env.currval.borrow_mut().insert(short.to_string(), v);
+            v
+        } else {
+            match self.env.currval.borrow().get(short) {
+                Some(v) => *v,
+                None => {
+                    return Err(OraError::new(
+                        8002,
+                        format!("sequence {short}.CURRVAL is not yet defined in this session"),
+                    ))
+                }
+            }
+        };
+        Ok(Value::Number(BigDecimal::from(v)))
+    }
+
     fn resolve(&self, scope: &Scope, table: Option<&str>, name: &str) -> Result<Value, OraError> {
         let mut s = Some(scope);
         while let Some(sc) = s {
@@ -798,6 +845,13 @@ impl Ex<'_> {
                 return Ok(sc.row.get(i).cloned().unwrap_or(Value::Null));
             }
             s = sc.parent;
+        }
+        if let Some(v) = self.vars.and_then(|vars| vars.lookup(table, name)) {
+            return Ok(v);
+        }
+        // A stored function without arguments can be called without parentheses.
+        if table.is_none() && self.db.routine(name).is_some() {
+            return self.call(name, Vec::new());
         }
         Err(invalid_column(table, name))
     }
@@ -808,6 +862,7 @@ impl Ex<'_> {
             Expr::Bind(i) => Ok(self.binds.get(*i).cloned().unwrap_or(Value::Null)),
             Expr::Column { table, name } => self.resolve(scope, table.as_deref(), name),
             Expr::RowNum => Ok(Value::number(scope.rownum)),
+            Expr::Sequence { name, next } => self.sequence(name, *next),
             Expr::Neg(a) => Ok(match self.eval(a, scope)?.to_number()? {
                 Some(n) => number(-n),
                 None => Value::Null,
@@ -820,7 +875,7 @@ impl Ex<'_> {
                 | BinaryOp::Lt
                 | BinaryOp::LtEq
                 | BinaryOp::Gt
-                | BinaryOp::GtEq => Err(OraError::new(920, "invalid relational operator")),
+                | BinaryOp::GtEq => self.condition_value(e, scope),
                 BinaryOp::Concat => {
                     let (x, y) = (self.eval(a, scope)?, self.eval(b, scope)?);
                     let mut s = self.to_text(&x).unwrap_or_default();
@@ -893,8 +948,15 @@ impl Ex<'_> {
             | Expr::InList { .. }
             | Expr::InSubquery { .. }
             | Expr::Exists(_)
-            | Expr::Like { .. } => Err(OraError::new(920, "invalid relational operator")),
+            | Expr::Like { .. } => self.condition_value(e, scope),
         }
+    }
+
+    /// A condition used as a value, as PL/SQL allows: TRUE, FALSE or NULL.
+    fn condition_value(&self, e: &Expr, scope: &Scope) -> Result<Value, OraError> {
+        Ok(self
+            .eval_bool(e, scope)?
+            .map_or(Value::Null, Value::Boolean))
     }
 
     fn aggregate(
@@ -1180,7 +1242,12 @@ impl Ex<'_> {
                 };
                 Ok(Some(like(&s, &p, esc)? != *negated))
             }
-            _ => Err(OraError::new(920, "invalid relational operator")),
+            // A BOOLEAN value, such as a PL/SQL variable or TRUE.
+            _ => match self.eval(e, scope)? {
+                Value::Boolean(b) => Ok(Some(b)),
+                Value::Null => Ok(None),
+                _ => Err(OraError::new(920, "invalid relational operator")),
+            },
         }
     }
 }
@@ -1371,6 +1438,8 @@ pub fn coerce_row(row: Vec<Value>, cols: &[RelCol], env: &Env) -> Result<Vec<Val
         .map(|(v, c)| {
             Ok(match (c.sql_type, v) {
                 (_, Value::Null) => Value::Null,
+                // SQL has no BOOLEAN type before 23ai.
+                (_, Value::Boolean(_)) => return Err(OraError::new(902, "invalid datatype")),
                 (SqlType::Number { .. }, v @ Value::Varchar2(_)) => {
                     Value::Number(v.to_number()?.unwrap())
                 }

@@ -1,33 +1,76 @@
 //! Recursive-descent parser for the supported subset of Oracle SQL.
 
+use std::collections::HashMap;
+
 use crate::ast::*;
 use crate::lexer::{tokenize, Tok, Token};
-use crate::{datetime, OraError, SqlType, Value};
+use crate::{datetime, BindDir, OraError, SqlType, Value};
 
-/// A parsed statement and the number of bind placeholders it contains.
+#[path = "plsql/parse.rs"]
+mod plsql;
+pub(crate) use plsql::pls;
+
+/// A parsed statement and its bind placeholders.
 #[derive(Debug, Clone)]
 pub struct Parsed {
     pub stmt: Statement,
+    /// The number of bind positions.
     pub binds: usize,
+    /// How each bind position is used.
+    pub bind_dirs: Vec<BindDir>,
 }
 
 pub fn parse(sql: &str) -> Result<Parsed, OraError> {
     let tokens = tokenize(sql)?;
+    // In PL/SQL, as in the drivers, a bind name repeated is one bind; in SQL each
+    // occurrence is its own position.
+    let plsql = matches!(tokens.first().map(|t| &t.tok),
+        Some(Tok::Ident(k)) if k == "BEGIN" || k == "DECLARE" || k == "CALL")
+        || matches!(tokens.first().map(|t| &t.tok), Some(Tok::Symbol("<<")));
     let mut p = Parser {
         sql,
         tokens,
         pos: 0,
         binds: 0,
+        bind_names: plsql.then(HashMap::new),
+        into_allowed: false,
+        into: None,
     };
     let stmt = p.statement()?;
-    match p.peek() {
-        None => Ok(Parsed {
-            stmt,
-            binds: p.binds,
-        }),
-        Some(Tok::Symbol(";")) => Err(OraError::new(911, "invalid character")),
-        Some(_) => Err(OraError::new(933, "SQL command not properly ended")),
+    // PL/SQL units end with a semicolon.
+    if matches!(stmt, Statement::Block(_) | Statement::CreateRoutine { .. }) {
+        p.eat_sym(";");
     }
+    match p.peek() {
+        None => {}
+        Some(Tok::Symbol(";")) => return Err(OraError::new(911, "invalid character")),
+        Some(_) => return Err(OraError::new(933, "SQL command not properly ended")),
+    }
+    let mut bind_dirs = vec![BindDir::In; p.binds];
+    match &stmt {
+        Statement::Block(_) => bind_dirs.fill(BindDir::InOut),
+        Statement::Insert(Insert {
+            returning: Some(r), ..
+        })
+        | Statement::Update(Update {
+            returning: Some(r), ..
+        })
+        | Statement::Delete(Delete {
+            returning: Some(r), ..
+        }) => {
+            for e in &r.into {
+                if let Expr::Bind(i) = e {
+                    bind_dirs[*i] = BindDir::Returning;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(Parsed {
+        stmt,
+        binds: p.binds,
+        bind_dirs,
+    })
 }
 
 /// Words that end an expression or clause, so they cannot be read as an alias.
@@ -76,7 +119,11 @@ const RESERVED: &[&str] = &[
     "NATURAL",
     "OUTER",
     "RETURNING",
+    "RETURN",
+    "INTO",
     "DISTINCT",
+    "LOOP",
+    "BULK",
 ];
 
 struct Parser<'a> {
@@ -84,6 +131,12 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
     binds: usize,
+    /// Bind positions by name, in PL/SQL where a repeated name is one bind.
+    bind_names: Option<HashMap<String, usize>>,
+    /// Whether the next SELECT may have an INTO clause (a PL/SQL SELECT statement).
+    into_allowed: bool,
+    /// The INTO targets of that SELECT.
+    into: Option<Vec<Expr>>,
 }
 
 fn missing_keyword() -> OraError {
@@ -255,6 +308,9 @@ impl Parser<'_> {
     // ---- statements ----
 
     fn statement(&mut self) -> Result<Statement, OraError> {
+        if self.is_sym("<<") {
+            return Ok(Statement::Block(Box::new(self.block()?)));
+        }
         if self.is_sym("(") {
             return Ok(Statement::Query(self.query()?));
         }
@@ -262,6 +318,8 @@ impl Parser<'_> {
             return Err(OraError::new(900, "invalid SQL statement"));
         };
         match first.as_str() {
+            "BEGIN" | "DECLARE" => Ok(Statement::Block(Box::new(self.block()?))),
+            "CALL" => Ok(Statement::Block(Box::new(self.call_statement()?))),
             "SELECT" => Ok(Statement::Query(self.query()?)),
             "WITH" => Err(unsupported("WITH clause")),
             "INSERT" => self.insert(),
@@ -288,6 +346,12 @@ impl Parser<'_> {
                     return Err(unsupported("savepoints"));
                 }
                 Ok(Statement::Rollback)
+            }
+            "ALTER" if self.is_kw_at(1, "SEQUENCE") => {
+                self.pos += 2;
+                let name = self.object_name()?;
+                let options = self.sequence_options(true)?;
+                Ok(Statement::AlterSequence { name, options })
             }
             "ALTER" if self.is_kw_at(1, "SESSION") => {
                 self.pos += 2;
@@ -332,13 +396,12 @@ impl Parser<'_> {
         } else {
             return Err(OraError::new(926, "missing VALUES keyword"));
         };
-        if self.is_kw("RETURNING") {
-            return Err(unsupported("RETURNING INTO"));
-        }
+        let returning = self.returning()?;
         Ok(Statement::Insert(Insert {
             table,
             columns,
             source,
+            returning,
         }))
     }
 
@@ -369,14 +432,13 @@ impl Parser<'_> {
         } else {
             None
         };
-        if self.is_kw("RETURNING") {
-            return Err(unsupported("RETURNING INTO"));
-        }
+        let returning = self.returning()?;
         Ok(Statement::Update(Update {
             table,
             alias,
             assignments,
             where_,
+            returning,
         }))
     }
 
@@ -390,14 +452,47 @@ impl Parser<'_> {
         } else {
             None
         };
-        if self.is_kw("RETURNING") {
-            return Err(unsupported("RETURNING INTO"));
-        }
+        let returning = self.returning()?;
         Ok(Statement::Delete(Delete {
             table,
             alias,
             where_,
+            returning,
         }))
+    }
+
+    /// `RETURNING expr, ... INTO target, ...` after INSERT, UPDATE or DELETE.
+    fn returning(&mut self) -> Result<Option<Returning>, OraError> {
+        if !self.eat_kw("RETURNING") && !self.eat_kw("RETURN") {
+            return Ok(None);
+        }
+        let mut exprs = vec![self.expr()?];
+        while self.eat_sym(",") {
+            exprs.push(self.expr()?);
+        }
+        if self.is_kw("BULK") {
+            return Err(unsupported("RETURNING BULK COLLECT"));
+        }
+        self.expect_kw("INTO")?;
+        let mut into = vec![self.returning_target()?];
+        while self.eat_sym(",") {
+            into.push(self.returning_target()?);
+        }
+        match exprs.len().cmp(&into.len()) {
+            std::cmp::Ordering::Less => return Err(OraError::new(913, "too many values")),
+            std::cmp::Ordering::Greater => return Err(OraError::new(947, "not enough values")),
+            _ => {}
+        }
+        Ok(Some(Returning { exprs, into }))
+    }
+
+    /// A bind variable, or in PL/SQL a variable or record field, to receive a value.
+    fn returning_target(&mut self) -> Result<Expr, OraError> {
+        match self.peek() {
+            Some(Tok::Bind(_)) => self.primary(),
+            Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_)) => self.column_ref(),
+            _ => Err(OraError::missing_expression()),
+        }
     }
 
     fn drop(&mut self) -> Result<Statement, OraError> {
@@ -412,13 +507,59 @@ impl Parser<'_> {
             self.skip_rest();
             return Ok(Statement::DropIndex { name });
         }
+        if self.eat_kw("SEQUENCE") {
+            let name = self.object_name()?;
+            return Ok(Statement::DropSequence { name });
+        }
+        if self.is_kw("PROCEDURE") || self.is_kw("FUNCTION") {
+            let function = self.eat_kw("FUNCTION");
+            if !function {
+                self.advance();
+            }
+            let name = self.object_name()?;
+            return Ok(Statement::DropRoutine { name, function });
+        }
+        if ["PACKAGE", "TRIGGER", "TYPE", "VIEW", "SYNONYM"]
+            .iter()
+            .any(|k| self.is_kw(k))
+        {
+            let what = self.ident()?.to_lowercase();
+            return Err(unsupported(&format!("{what}s")));
+        }
         Err(OraError::new(950, "invalid DROP option"))
     }
 
     fn create(&mut self) -> Result<Statement, OraError> {
         self.advance();
-        if self.eat_kw("OR") {
+        let or_replace = self.eat_kw("OR");
+        if or_replace {
             self.expect_kw("REPLACE")?;
+        }
+        if !self.eat_kw("EDITIONABLE") {
+            self.eat_kw("NONEDITIONABLE");
+        }
+        if self.is_kw("PROCEDURE") || self.is_kw("FUNCTION") {
+            let routine = self.routine()?;
+            // The name may be repeated after the final END.
+            if self.is_ident_at(0) {
+                self.advance();
+            }
+            return Ok(Statement::CreateRoutine {
+                routine: std::sync::Arc::new(routine),
+                or_replace,
+            });
+        }
+        if ["PACKAGE", "TRIGGER", "TYPE", "VIEW", "SYNONYM"]
+            .iter()
+            .any(|k| self.is_kw(k))
+        {
+            let what = self.ident()?.to_lowercase();
+            return Err(unsupported(&format!("{what}s")));
+        }
+        if self.eat_kw("SEQUENCE") {
+            let name = self.object_name()?;
+            let options = self.sequence_options(false)?;
+            return Ok(Statement::CreateSequence { name, options });
         }
         // Global temporary tables are created as normal tables.
         if self.eat_kw("GLOBAL") {
@@ -428,9 +569,6 @@ impl Parser<'_> {
         self.eat_kw("BITMAP");
         if self.eat_kw("INDEX") {
             return self.create_index(unique);
-        }
-        if self.is_kw("SEQUENCE") {
-            return Err(unsupported("sequences"));
         }
         if !self.eat_kw("TABLE") {
             return Err(OraError::new(901, "invalid CREATE command"));
@@ -475,6 +613,58 @@ impl Parser<'_> {
             constraints,
             as_query,
         }))
+    }
+
+    fn sequence_options(&mut self, alter: bool) -> Result<Vec<SequenceOption>, OraError> {
+        let mut options = Vec::new();
+        let number = |p: &mut Self| -> Result<i128, OraError> {
+            let neg = p.eat_sym("-");
+            if !neg {
+                p.eat_sym("+");
+            }
+            match p.advance() {
+                Some(Tok::Number(n)) => n
+                    .parse::<i128>()
+                    .map(|v| if neg { -v } else { v })
+                    .map_err(|_| OraError::new(1722, "invalid number")),
+                _ => Err(OraError::new(1722, "invalid number")),
+            }
+        };
+        while let Some(Tok::Ident(k)) = self.peek().cloned() {
+            self.advance();
+            options.push(match k.as_str() {
+                "START" => {
+                    self.expect_kw("WITH")?;
+                    SequenceOption::StartWith(number(self)?)
+                }
+                "INCREMENT" => {
+                    self.expect_kw("BY")?;
+                    SequenceOption::IncrementBy(number(self)?)
+                }
+                "MINVALUE" => SequenceOption::MinValue(Some(number(self)?)),
+                "NOMINVALUE" => SequenceOption::MinValue(None),
+                "MAXVALUE" => SequenceOption::MaxValue(Some(number(self)?)),
+                "NOMAXVALUE" => SequenceOption::MaxValue(None),
+                "CYCLE" => SequenceOption::Cycle(true),
+                "NOCYCLE" => SequenceOption::Cycle(false),
+                "RESTART" if alter => {
+                    if self.eat_kw("START") {
+                        self.expect_kw("WITH")?;
+                        SequenceOption::Restart(Some(number(self)?))
+                    } else {
+                        SequenceOption::Restart(None)
+                    }
+                }
+                "CACHE" => {
+                    number(self)?;
+                    continue;
+                }
+                "NOCACHE" | "ORDER" | "NOORDER" | "KEEP" | "NOKEEP" | "SESSION" | "GLOBAL"
+                | "NOSCALE" | "NOSHARD" => continue,
+                _ => return Err(OraError::new(933, "SQL command not properly ended")),
+            });
+        }
+        Ok(options)
     }
 
     fn create_index(&mut self, unique: bool) -> Result<Statement, OraError> {
@@ -923,6 +1113,17 @@ impl Parser<'_> {
         while self.eat_sym(",") {
             items.push(self.select_item()?);
         }
+        if self.into_allowed && self.is_kw("INTO") {
+            self.advance();
+            self.into_allowed = false;
+            let mut into = vec![self.returning_target()?];
+            while self.eat_sym(",") {
+                into.push(self.returning_target()?);
+            }
+            self.into = Some(into);
+        } else if self.is_kw("BULK") {
+            return Err(unsupported("BULK COLLECT"));
+        }
         if !self.eat_kw("FROM") {
             return Err(OraError::new(923, "FROM keyword not found where expected"));
         }
@@ -1212,8 +1413,14 @@ impl Parser<'_> {
                 self.advance();
                 Ok(Expr::Literal(Value::varchar(s)))
             }
-            Some(Tok::Bind(_)) => {
+            Some(Tok::Bind(name)) => {
                 self.advance();
+                if let Some(names) = &mut self.bind_names {
+                    if let Some(&i) = names.get(&name) {
+                        return Ok(Expr::Bind(i));
+                    }
+                    names.insert(name, self.binds);
+                }
                 self.binds += 1;
                 Ok(Expr::Bind(self.binds - 1))
             }
@@ -1248,6 +1455,10 @@ impl Parser<'_> {
             "NULL" => {
                 self.advance();
                 Ok(Expr::Literal(Value::Null))
+            }
+            "TRUE" | "FALSE" if !self.is_sym_at(1, "(") && !self.is_sym_at(1, ".") => {
+                self.advance();
+                Ok(Expr::Literal(Value::Boolean(k == "TRUE")))
             }
             "DATE" if next_is_str => {
                 let s = self.string_after_keyword();
@@ -1301,6 +1512,16 @@ impl Parser<'_> {
 
     fn column_ref(&mut self) -> Result<Expr, OraError> {
         let first = self.ident()?;
+        // PL/SQL attributes such as SQL%ROWCOUNT and cursor%NOTFOUND are read like
+        // columns of a record named `SQL%` or `CURSOR%`.
+        if self.is_sym("%") && self.is_ident_at(1) {
+            self.advance();
+            let attr = self.ident()?;
+            return Ok(Expr::Column {
+                table: Some(format!("{first}%")),
+                name: attr,
+            });
+        }
         if !(self.is_sym(".") && self.is_ident_at(1)) {
             return Ok(Expr::Column {
                 table: None,
@@ -1310,12 +1531,21 @@ impl Parser<'_> {
         self.advance();
         let second = self.ident()?;
         if matches!(second.as_str(), "NEXTVAL" | "CURRVAL") {
-            return Err(unsupported("sequences"));
+            return Ok(Expr::Sequence {
+                name: first,
+                next: second == "NEXTVAL",
+            });
         }
         // schema.table.column: keep the table qualifier.
         if self.is_sym(".") && self.is_ident_at(1) {
             self.advance();
             let third = self.ident()?;
+            if matches!(third.as_str(), "NEXTVAL" | "CURRVAL") {
+                return Ok(Expr::Sequence {
+                    name: second,
+                    next: third == "NEXTVAL",
+                });
+            }
             return Ok(Expr::Column {
                 table: Some(second),
                 name: third,

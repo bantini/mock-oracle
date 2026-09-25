@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::ast::Expr;
+use crate::plsql::Routine;
 use crate::value::key_string;
 use crate::{SqlType, Value};
 
@@ -201,10 +202,24 @@ impl Table {
     }
 }
 
-/// All tables. Cloning is cheap: tables are shared until written (copy on write).
+/// A sequence's definition. Its counter lives in the [`crate::Database`], outside
+/// transactions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequenceDef {
+    pub start: i128,
+    pub increment: i128,
+    pub min: i128,
+    pub max: i128,
+    pub cycle: bool,
+}
+
+/// All tables, sequences and stored routines. Cloning is cheap: tables are shared until written (copy on write).
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     pub tables: BTreeMap<String, Arc<Table>>,
+    pub sequences: BTreeMap<String, SequenceDef>,
+    /// Stored procedures and functions.
+    pub routines: BTreeMap<String, Arc<Routine>>,
     /// Bumped on every commit and DDL, so a transaction can tell whether it is still current.
     pub version: u64,
 }
@@ -218,9 +233,11 @@ impl Catalog {
         self.tables.get_mut(name).map(Arc::make_mut)
     }
 
-    /// Whether a table, constraint or index already uses `name`.
+    /// Whether a table, sequence, routine, constraint or index already uses `name`.
     pub fn name_in_use(&self, name: &str) -> bool {
         self.tables.contains_key(name)
+            || self.sequences.contains_key(name)
+            || self.routines.contains_key(name)
             || self
                 .tables
                 .values()

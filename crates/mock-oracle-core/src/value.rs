@@ -123,12 +123,13 @@ pub fn key_string<'a>(values: impl IntoIterator<Item = &'a Value>) -> String {
             }
             Value::Date(d) | Value::Timestamp(d) => {
                 key.push('d');
-                key.push_str(
-                    &d.and_utc()
-                        .timestamp_nanos_opt()
-                        .unwrap_or_default()
-                        .to_string(),
-                );
+                // Seconds plus nanoseconds is exact across chrono's whole range.
+                let utc = d.and_utc();
+                key.push_str(&format!(
+                    "{}.{:09}",
+                    utc.timestamp(),
+                    utc.timestamp_subsec_nanos()
+                ));
             }
         }
         key.push('\u{1}');

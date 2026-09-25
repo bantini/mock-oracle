@@ -763,10 +763,123 @@ fn scripts() {
     );
     assert_eq!(parts.len(), 3, "{parts:?}");
     assert_eq!(parts[1], "insert into x values ('a;b')");
+    assert_eq!(
+        split_script("select 1 from dual\n/  \t\nselect 2 from dual\n/\r\n").len(),
+        2
+    );
     let db = db();
     let e = db
         .run_script("create table y (a number); insert into y values ('q')")
         .unwrap_err();
     assert_eq!(e.code, 1722);
     assert!(e.message.contains("insert into y"), "{}", e.message);
+}
+
+#[test]
+fn hostile_arguments_return_errors_not_panics() {
+    let db = db();
+    assert_eq!(err(&db, "select date '2024-01-01' + 1e7 from dual"), 1841);
+    assert_eq!(err(&db, "select add_months(sysdate, 1e9) from dual"), 1841);
+    assert_eq!(
+        one(&db, "select substr('hello', 2, 1e20) from dual"),
+        s("ello")
+    );
+    assert_eq!(
+        one(&db, "select substr('hello', -1e20) from dual"),
+        Value::Null
+    );
+    assert_eq!(
+        one(&db, "select instr('hello', 'll', 1e20) from dual"),
+        n("0")
+    );
+    assert_eq!(
+        one(&db, "select instr('hello', 'l', -1e20) from dual"),
+        n("0")
+    );
+    assert_eq!(
+        one(&db, "select length(lpad('x', 1e12)) from dual"),
+        n("32767")
+    );
+    assert_eq!(one(&db, "select round(1.5, 1e18) from dual"), n("1.5"));
+    assert_eq!(one(&db, "select round(12345, -1e18) from dual"), n("0"));
+    // Non-ASCII text in a format model: quoted literals pass through, other letters are rejected.
+    assert_eq!(
+        one(
+            &db,
+            "select to_char(date '2024-01-01', '\"ıı\"YYYY') from dual"
+        ),
+        s("ıı2024")
+    );
+    assert_eq!(
+        err(&db, "alter session set nls_date_format = 'ıYYYY'"),
+        1821
+    );
+}
+
+#[test]
+fn far_dates_have_distinct_keys() {
+    let db = db();
+    db.run_script(
+        "create table d (x date unique);
+         insert into d values (date '9999-12-31');
+         insert into d values (date '0001-01-01');",
+    )
+    .unwrap();
+    assert_eq!(one(&db, "select count(distinct x) from d"), n("2"));
+}
+
+#[test]
+fn statement_failures_and_empty_transactions() {
+    let db = emp();
+    let mut a = db.session("app");
+    // A failing multi-row UPDATE leaves every row as it was.
+    a.execute("insert into dept values (40, 'Ops')", &[])
+        .unwrap();
+    assert_eq!(
+        a.execute("update dept set name = 'Same'", &[])
+            .unwrap_err()
+            .code,
+        1
+    );
+    let r = a
+        .execute("select name from dept order by id", &[])
+        .unwrap()
+        .rows;
+    assert_eq!(
+        r,
+        vec![
+            vec![s("Sales")],
+            vec![s("Engineering")],
+            vec![s("Empty")],
+            vec![s("Ops")]
+        ]
+    );
+    // A failing INSERT ... SELECT keeps nothing from the statement.
+    assert_eq!(
+        a.execute("insert into dept select id + 100, 'X' from dept", &[])
+            .unwrap_err()
+            .code,
+        1
+    );
+    assert_eq!(
+        a.execute("select count(*) from dept", &[]).unwrap().rows[0][0],
+        n("4")
+    );
+    a.rollback();
+    // DML that changes nothing does not pin the session to an old snapshot.
+    let mut b = db.session("app");
+    a.execute("delete from dept where 1 = 0", &[]).unwrap();
+    assert!(!a.in_transaction());
+    b.execute("create table later (x number)", &[]).unwrap();
+    b.execute("insert into dept values (50, 'New')", &[])
+        .unwrap();
+    b.commit().unwrap();
+    assert_eq!(
+        a.execute("select count(*) from later", &[]).unwrap().rows[0][0],
+        n("0")
+    );
+    assert_eq!(
+        a.execute("select count(*) from dept", &[]).unwrap().rows[0][0],
+        n("4")
+    );
 }

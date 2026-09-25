@@ -25,11 +25,20 @@ fn num(v: &Value) -> Result<Option<BigDecimal>, OraError> {
     v.to_number()
 }
 
+/// Integer arguments are clamped to this magnitude, far beyond any string length,
+/// so position and length arithmetic cannot overflow.
+const MAX_INT_ARG: i64 = 1_000_000_000_000;
+
+/// The longest string a function builds, VARCHAR2's extended maximum.
+const MAX_STRING_CHARS: usize = 32767;
+
 fn int(v: &Value) -> Result<Option<i64>, OraError> {
     Ok(num(v)?.map(|n| {
-        n.with_scale_round(0, RoundingMode::Down)
-            .to_i64()
-            .unwrap_or(i64::MAX)
+        let n = n.with_scale_round(0, RoundingMode::Down);
+        let fallback = if n < 0 { -MAX_INT_ARG } else { MAX_INT_ARG };
+        n.to_i64()
+            .unwrap_or(fallback)
+            .clamp(-MAX_INT_ARG, MAX_INT_ARG)
     }))
 }
 
@@ -316,7 +325,7 @@ impl Ex<'_> {
                 if n <= 0 {
                     return Ok(Value::Null);
                 }
-                let n = n as usize;
+                let n = (n as usize).min(MAX_STRING_CHARS);
                 let chars: Vec<char> = s.chars().collect();
                 if chars.len() >= n {
                     return Ok(Value::varchar(chars[..n].iter().collect::<String>()));
@@ -467,7 +476,7 @@ impl Ex<'_> {
                         };
                         let places = match a.get(1) {
                             Some(p) => match int(p)? {
-                                Some(p) => p,
+                                Some(p) => p.clamp(-126, 127),
                                 None => return Ok(Value::Null),
                             },
                             None => 0,
@@ -612,8 +621,8 @@ impl Ex<'_> {
                 };
                 Ok(Value::Date(datetime::add_months(
                     &d.with_nanosecond(0).unwrap(),
-                    n as i32,
-                )))
+                    n,
+                )?))
             }
             "LAST_DAY" => {
                 check_args(a, 1, 1)?;
@@ -679,7 +688,7 @@ fn round_date(d: &NaiveDateTime, unit: &str) -> Result<NaiveDateTime, OraError> 
         "MM" | "MON" | "MONTH" => {
             let start = datetime::trunc(d, "MM")?;
             Ok(if d.day() >= 16 {
-                datetime::add_months(&start, 1)
+                datetime::add_months(&start, 1)?
             } else {
                 start
             })
@@ -687,7 +696,7 @@ fn round_date(d: &NaiveDateTime, unit: &str) -> Result<NaiveDateTime, OraError> 
         "YYYY" | "YEAR" | "Y" | "YY" | "YYY" => {
             let start = datetime::trunc(d, "YYYY")?;
             Ok(if d.month() >= 7 {
-                datetime::add_months(&start, 12)
+                datetime::add_months(&start, 12)?
             } else {
                 start
             })

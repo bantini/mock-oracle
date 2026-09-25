@@ -22,10 +22,13 @@ enum Change {
         table: String,
         id: u64,
         values: Vec<Value>,
+        /// The values before the change, to undo a failed statement.
+        old: Vec<Value>,
     },
     Delete {
         table: String,
         id: u64,
+        old: Vec<Value>,
     },
 }
 
@@ -166,7 +169,9 @@ impl Session {
                             .map_err(|c| unique_violation(&self.env.user, &c))?;
                     }
                 }
-                Change::Update { table, id, values } => {
+                Change::Update {
+                    table, id, values, ..
+                } => {
                     if let Some(t) = next
                         .table_mut(&table)
                         .filter(|t| t.columns.len() == values.len())
@@ -175,7 +180,7 @@ impl Session {
                             .map_err(|c| unique_violation(&self.env.user, &c))?;
                     }
                 }
-                Change::Delete { table, id } => {
+                Change::Delete { table, id, .. } => {
                     if let Some(t) = next.table_mut(&table) {
                         t.delete(id);
                     }
@@ -223,7 +228,7 @@ impl Session {
             }
         });
         // Statement-level atomicity: a failing statement undoes only its own changes.
-        let saved = (txn.work.clone(), txn.log.len());
+        let saved = txn.log.len();
         let result = match stmt {
             Statement::Insert(i) => insert(&db, &self.env, txn, i, binds),
             Statement::Update(u) => update(&self.env, txn, u, binds),
@@ -231,8 +236,11 @@ impl Session {
             _ => unreachable!(),
         };
         if result.is_err() {
-            txn.work = saved.0;
-            txn.log.truncate(saved.1);
+            undo(txn, saved);
+        }
+        // Without changes there is no transaction, so later queries see other sessions' commits.
+        if txn.log.is_empty() {
+            self.txn = None;
         }
         result
     }
@@ -424,6 +432,40 @@ impl Session {
             _ => unreachable!("not DDL"),
         }
         Ok(())
+    }
+}
+
+/// Reverts the log entries after `keep`, newest first. The rows of one UPDATE are
+/// reverted together so swapped unique keys do not collide on the way back.
+fn undo(txn: &mut Txn, keep: usize) {
+    let mut changes = txn.log.split_off(keep);
+    while let Some(change) = changes.pop() {
+        match change {
+            Change::Insert { table, id, .. } => {
+                if let Some(t) = txn.work.table_mut(&table) {
+                    t.delete(id);
+                }
+            }
+            Change::Delete { table, id, old } => {
+                if let Some(t) = txn.work.table_mut(&table) {
+                    let _ = t.insert(id, old);
+                }
+            }
+            Change::Update { table, id, old, .. } => {
+                let mut batch = vec![(id, old)];
+                while let Some(Change::Update { table: next, .. }) = changes.last() {
+                    if *next != table {
+                        break;
+                    }
+                    if let Some(Change::Update { id, old, .. }) = changes.pop() {
+                        batch.push((id, old));
+                    }
+                }
+                if let Some(t) = txn.work.table_mut(&table) {
+                    let _ = t.update(batch);
+                }
+            }
+        }
     }
 }
 
@@ -738,6 +780,7 @@ fn update(env: &Env, txn: &mut Txn, upd: &Update, binds: &[Value]) -> Result<u64
         targets.push(i);
     }
     let mut changes = Vec::new();
+    let mut olds = Vec::new();
     for (id, old) in matching_rows(&ex, t, &cols, &upd.where_)? {
         let mut new = old.clone();
         for ((_, e), &i) in upd.assignments.iter().zip(&targets) {
@@ -746,17 +789,19 @@ fn update(env: &Env, txn: &mut Txn, upd: &Update, binds: &[Value]) -> Result<u64
         }
         check_row(&ex, t, &new, true)?;
         changes.push((id, new));
+        olds.push(old);
     }
     let count = changes.len() as u64;
     let table = txn.work.table_mut(&upd.table).unwrap();
     table
         .update(changes.clone())
         .map_err(|c| unique_violation(&env.user, &c))?;
-    for (id, values) in changes {
+    for ((id, values), old) in changes.into_iter().zip(olds) {
         txn.log.push(Change::Update {
             table: upd.table.clone(),
             id,
             values,
+            old,
         });
     }
     Ok(count)
@@ -773,17 +818,16 @@ fn delete(env: &Env, txn: &mut Txn, del: &Delete, binds: &[Value]) -> Result<u64
         .table(&del.table)
         .ok_or_else(OraError::table_not_found)?;
     let cols = table_scope_cols(t, del.alias.as_deref().unwrap_or(&del.table));
-    let ids: Vec<u64> = matching_rows(&ex, t, &cols, &del.where_)?
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
+    let rows = matching_rows(&ex, t, &cols, &del.where_)?;
+    let count = rows.len() as u64;
     let table = txn.work.table_mut(&del.table).unwrap();
-    for &id in &ids {
+    for (id, old) in rows {
         table.delete(id);
         txn.log.push(Change::Delete {
             table: del.table.clone(),
             id,
+            old,
         });
     }
-    Ok(ids.len() as u64)
+    Ok(count)
 }

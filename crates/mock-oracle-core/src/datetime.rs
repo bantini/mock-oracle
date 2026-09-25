@@ -92,12 +92,15 @@ fn apply_case(s: &str, case: Case) -> String {
 
 fn tokenize(fmt: &str) -> Result<Vec<(Elem, Case)>, OraError> {
     let mut out = Vec::new();
-    let upper = fmt.to_uppercase();
     let mut i = 0;
     let bad = || OraError::new(1821, "date format not recognized");
     while i < fmt.len() {
-        let rest = &upper[i..];
         let orig = &fmt[i..];
+        // Match keywords case-insensitively against the original text so byte offsets stay valid.
+        let starts = |k: &str| {
+            orig.get(..k.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(k))
+        };
         let case = case_of(orig);
         if let Some(stripped) = orig.strip_prefix('"') {
             let end = stripped.find('"').ok_or_else(bad)?;
@@ -105,7 +108,7 @@ fn tokenize(fmt: &str) -> Result<Vec<(Elem, Case)>, OraError> {
             i += end + 2;
             continue;
         }
-        let c = rest.chars().next().unwrap();
+        let c = orig.chars().next().unwrap();
         if matches!(c, '-' | '/' | ',' | '.' | ';' | ':' | ' ') {
             out.push((Elem::Literal(c.to_string()), case));
             i += 1;
@@ -136,8 +139,8 @@ fn tokenize(fmt: &str) -> Result<Vec<(Elem, Case)>, OraError> {
             ("FM", Elem::Fm),
             ("X", Elem::X),
         ];
-        if let Some(rest_ff) = rest.strip_prefix("FF") {
-            let digits = rest_ff
+        if starts("FF") {
+            let digits = orig[2..]
                 .chars()
                 .next()
                 .filter(|c| c.is_ascii_digit() && *c != '0');
@@ -146,7 +149,7 @@ fn tokenize(fmt: &str) -> Result<Vec<(Elem, Case)>, OraError> {
             out.push((Elem::Ff(precision), case));
             continue;
         }
-        match table.iter().find(|(k, _)| rest.starts_with(k)) {
+        match table.iter().find(|(k, _)| starts(k)) {
             Some((k, e)) => {
                 out.push((e.clone(), case));
                 i += k.len();
@@ -364,9 +367,23 @@ pub fn parse(s: &str, fmt: &str) -> Result<NaiveDateTime, OraError> {
 }
 
 /// Adds months the way ADD_MONTHS does: the last day of a month maps to the last day.
-pub fn add_months(d: &NaiveDateTime, months: i32) -> NaiveDateTime {
-    let total = d.year() * 12 + d.month0() as i32 + months;
-    let (year, month) = (total.div_euclid(12), total.rem_euclid(12) as u32 + 1);
+/// ORA-01841, for date arithmetic that leaves the supported range.
+pub fn out_of_range() -> OraError {
+    OraError::new(
+        1841,
+        "(full) year must be between -4713 and +9999, and not be 0",
+    )
+}
+
+pub fn add_months(d: &NaiveDateTime, months: i64) -> Result<NaiveDateTime, OraError> {
+    let total = (d.year() as i64 * 12 + d.month0() as i64)
+        .checked_add(months)
+        .ok_or_else(out_of_range)?;
+    let year = total.div_euclid(12);
+    if !(-4713..=9999).contains(&year) {
+        return Err(out_of_range());
+    }
+    let (year, month) = (year as i32, total.rem_euclid(12) as u32 + 1);
     let last = last_day_of(year, month);
     let day = if d.day() == last_day_of(d.year(), d.month()) {
         last
@@ -374,8 +391,8 @@ pub fn add_months(d: &NaiveDateTime, months: i32) -> NaiveDateTime {
         d.day().min(last)
     };
     NaiveDate::from_ymd_opt(year, month, day)
-        .unwrap()
-        .and_time(d.time())
+        .map(|date| date.and_time(d.time()))
+        .ok_or_else(out_of_range)
 }
 
 pub fn last_day_of(year: i32, month: u32) -> u32 {
@@ -467,15 +484,15 @@ mod tests {
     #[test]
     fn month_arithmetic() {
         assert_eq!(
-            add_months(&dt("2024-01-31 10:00:00"), 1),
+            add_months(&dt("2024-01-31 10:00:00"), 1).unwrap(),
             dt("2024-02-29 10:00:00")
         );
         assert_eq!(
-            add_months(&dt("2024-02-29 00:00:00"), 12),
+            add_months(&dt("2024-02-29 00:00:00"), 12).unwrap(),
             dt("2025-02-28 00:00:00")
         );
         assert_eq!(
-            add_months(&dt("2024-03-15 00:00:00"), -3),
+            add_months(&dt("2024-03-15 00:00:00"), -3).unwrap(),
             dt("2023-12-15 00:00:00")
         );
         assert_eq!(

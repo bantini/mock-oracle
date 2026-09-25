@@ -137,6 +137,14 @@ test('executeMany inserts every row', async () => {
   assert.deepEqual(check.rows, [['A'], ['B'], ['C']]);
 });
 
+test('executeMany without binds runs the statement the requested number of times', async () => {
+  await conn.execute('create table ticks (n number)');
+  const r = await conn.executeMany('insert into ticks values (1)', 3);
+  assert.equal(r.rowsAffected, 3);
+  assert.deepEqual((await conn.execute('select count(*) from ticks')).rows, [[3]]);
+  await conn.execute('drop table ticks');
+});
+
 test('JavaScript dates round-trip through DATE and TIMESTAMP columns', async () => {
   const hired = new Date(2024, 1, 29, 13, 45, 30);
   const updated = new Date(2024, 1, 29, 13, 45, 30, 123);

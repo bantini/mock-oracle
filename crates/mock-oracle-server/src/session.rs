@@ -475,7 +475,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             0
         };
         let commit = options & EXEC_COMMIT != 0;
-        self.run_statement(cursor_id, sql, bind_types, bind_rows, fetch, commit, out);
+        // al8i4[1] is the execution count for DML (executeMany without binds); al8i4[7] marks a query.
+        let executions = if al8i4[7] == 1 { 1 } else { al8i4[1] };
+        self.run_statement(
+            cursor_id, sql, bind_types, bind_rows, executions, fetch, commit, out,
+        );
         Ok(())
     }
 
@@ -495,6 +499,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             return Ok(());
         };
         let (sql, bind_types) = (cursor.sql.clone(), cursor.bind_types.clone());
+        // For DML the iteration count is the number of executions; queries run once.
+        let executions = if cursor.columns.is_empty() {
+            num_iters
+        } else {
+            1
+        };
         let tz = self.db().time_zone_offset();
         let mut bind_rows = Vec::new();
         if !bind_types.is_empty() {
@@ -504,7 +514,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         }
         let fetch = if flags1 & 0x20 != 0 { num_iters } else { 0 };
         let commit = flags2 & EXEC_COMMIT_REEXECUTE != 0;
-        self.run_statement(cursor_id, sql, bind_types, bind_rows, fetch, commit, out);
+        self.run_statement(
+            cursor_id, sql, bind_types, bind_rows, executions, fetch, commit, out,
+        );
         Ok(())
     }
 
@@ -520,7 +532,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         }
     }
 
-    /// Executes `sql` once per bind row and writes the describe info, the first
+    /// Executes `sql` once per bind row (or `executions` times without binds) and writes the describe info, the first
     /// `fetch` rows and the closing error/status message.
     #[allow(clippy::too_many_arguments)]
     fn run_statement(
@@ -529,19 +541,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         sql: String,
         bind_types: Vec<u8>,
         bind_rows: Vec<Vec<Value>>,
+        executions: u32,
         fetch: u32,
         commit: bool,
         out: &mut WriteBuf,
     ) {
-        tracing::debug!(%sql, ?bind_rows, "execute");
-        let executions = if bind_rows.is_empty() {
-            vec![Vec::new()]
+        tracing::debug!(%sql, "execute");
+        let runs = if bind_rows.is_empty() {
+            executions.max(1) as usize
         } else {
-            bind_rows
+            bind_rows.len()
         };
         let mut result = None;
         let mut rows_affected = 0;
-        for binds in &executions {
+        for i in 0..runs {
+            let binds = bind_rows.get(i).map_or(&[][..], Vec::as_slice);
             match self.db().execute(&sql, binds) {
                 Ok(r) => {
                     rows_affected += r.rows_affected;
@@ -729,8 +743,16 @@ fn decode_date(b: &[u8]) -> io::Result<NaiveDateTime> {
     } else {
         0
     };
+    // Time bytes are stored plus one, so zero is never valid.
+    let (Some(hour), Some(minute), Some(second)) = (
+        b[4].checked_sub(1),
+        b[5].checked_sub(1),
+        b[6].checked_sub(1),
+    ) else {
+        return Err(invalid("invalid date value".into()));
+    };
     NaiveDate::from_ymd_opt(year, b[2] as u32, b[3] as u32)
-        .and_then(|d| d.and_hms_nano_opt(b[4] as u32 - 1, b[5] as u32 - 1, b[6] as u32 - 1, nanos))
+        .and_then(|d| d.and_hms_nano_opt(hour as u32, minute as u32, second as u32, nanos))
         .ok_or_else(|| invalid("invalid date value".into()))
 }
 

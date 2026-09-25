@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use bigdecimal::BigDecimal;
-use chrono::{Duration, NaiveDateTime};
+use chrono::{Datelike, Duration, NaiveDateTime};
 
 use crate::ast::*;
 use crate::catalog::Catalog;
@@ -1020,14 +1020,15 @@ impl Ex<'_> {
                 let days = n.to_number()?.unwrap();
                 let secs = (days * BigDecimal::from(86_400))
                     .with_scale_round(0, bigdecimal::RoundingMode::HalfUp);
-                let secs: i64 = secs.to_string().parse().map_err(|_| {
-                    OraError::new(
-                        1841,
-                        "(full) year must be between -4713 and +9999, and not be 0",
-                    )
-                })?;
+                let secs: i64 = secs
+                    .to_string()
+                    .parse()
+                    .map_err(|_| datetime::out_of_range())?;
                 let secs = if op == BinaryOp::Sub { -secs } else { secs };
-                let d = d.with_nanosecond_zero() + Duration::seconds(secs);
+                let d = Duration::try_seconds(secs)
+                    .and_then(|delta| d.with_nanosecond_zero().checked_add_signed(delta))
+                    .filter(|d| (-4713..=9999).contains(&d.year()))
+                    .ok_or_else(datetime::out_of_range)?;
                 Ok(Value::Date(d))
             }
             (_, true, _) | (_, _, true) => Err(OraError::inconsistent("NUMBER", "DATE")),

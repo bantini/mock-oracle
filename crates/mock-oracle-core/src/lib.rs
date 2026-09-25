@@ -207,7 +207,16 @@ pub fn split_script(script: &str) -> Vec<String> {
                 current.push(' ');
             }
             ';' => flush(&mut current, &mut out),
-            '/' if at_line_start && chars.peek().map_or(true, |n| *n == '\n' || *n == '\r') => {
+            // A line holding only `/` (and whitespace) ends a statement.
+            '/' if at_line_start
+                && chars
+                    .clone()
+                    .take_while(|n| *n != '\n')
+                    .all(char::is_whitespace) =>
+            {
+                while chars.peek().is_some_and(|n| *n != '\n') {
+                    chars.next();
+                }
                 flush(&mut current, &mut out)
             }
             _ => current.push(c),

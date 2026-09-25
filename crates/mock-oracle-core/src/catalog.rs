@@ -111,29 +111,50 @@ impl Table {
 
     /// Replaces the values of several rows at once, so that for example `SET id = id + 1`
     /// does not trip over its own intermediate state. Rows that no longer exist are skipped.
-    /// On a unique violation the table is left partly updated; callers discard it.
+    /// On a unique violation nothing changes.
     pub fn update(&mut self, changes: Vec<(u64, Vec<Value>)>) -> Result<(), String> {
         let changes: Vec<_> = changes
             .into_iter()
             .filter(|(id, _)| self.rows.contains_key(id))
             .collect();
-        for (id, _) in &changes {
-            let old = self.rows[id].clone();
-            self.unindex(&old);
+        let olds: Vec<Vec<Value>> = changes
+            .iter()
+            .map(|(id, _)| self.rows[id].clone())
+            .collect();
+        for old in &olds {
+            self.unindex(old);
         }
-        for (id, values) in changes {
+        // Check every new key before changing anything, so a violation leaves the table as it was.
+        let mut conflict = None;
+        'check: for c in &self.constraints {
+            if let ConstraintKind::Unique { columns, index, .. } = &c.kind {
+                let mut seen = std::collections::HashSet::new();
+                for (_, values) in &changes {
+                    if let Some(k) = unique_key(columns, values) {
+                        if index.contains_key(&k) || !seen.insert(k) {
+                            conflict = Some(c.name.clone());
+                            break 'check;
+                        }
+                    }
+                }
+            }
+        }
+        let rows = if conflict.is_some() {
+            changes.iter().map(|(id, _)| *id).zip(olds).collect()
+        } else {
+            changes
+        };
+        for (id, values) in rows {
             for c in &mut self.constraints {
                 if let ConstraintKind::Unique { columns, index, .. } = &mut c.kind {
                     if let Some(k) = unique_key(columns, &values) {
-                        if index.insert(k, id).is_some_and(|other| other != id) {
-                            return Err(c.name.clone());
-                        }
+                        index.insert(k, id);
                     }
                 }
             }
             self.rows.insert(id, values);
         }
-        Ok(())
+        conflict.map_or(Ok(()), Err)
     }
 
     pub fn truncate(&mut self) {

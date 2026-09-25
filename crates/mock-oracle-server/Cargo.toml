@@ -7,7 +7,14 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+aes = "0.8"
+cbc = "0.1"
+hex = "0.4"
 mock-oracle-core.workspace = true
+pbkdf2 = "0.12"
+rand = "0.8"
+sha2 = "0.10"
+thiserror = "2"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

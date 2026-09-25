@@ -7,4 +7,5 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+bigdecimal = "0.4"
 thiserror.workspace = true

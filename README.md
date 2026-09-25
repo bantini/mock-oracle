@@ -39,22 +39,26 @@ Installing needs no Rust toolchain, Oracle client or Docker.
 const { MockOracle } = require('mock-oracle');
 const oracledb = require('oracledb');
 
-const db = await MockOracle.start({
-  seed: `
-    create table dept (id number(4) primary key, name varchar2(30) not null);
-    insert into dept values (10, 'Sales');
-  `,
-});
+async function main() {
+  const db = await MockOracle.start({
+    seed: `
+      create table dept (id number(4) primary key, name varchar2(30) not null);
+      insert into dept values (10, 'Sales');
+    `,
+  });
 
-const conn = await oracledb.getConnection({
-  user: 'test',                      // any user name works
-  password: 'oracle',                // the default password
-  connectString: db.connectString,   // e.g. "localhost:40213/FREEPDB1"
-});
-const { rows } = await conn.execute('select name from dept');   // [['Sales']]
+  const conn = await oracledb.getConnection({
+    user: 'test',                      // any user name works
+    password: 'oracle',                // the default password
+    connectString: db.connectString,   // e.g. "localhost:40213/FREEPDB1"
+  });
+  const { rows } = await conn.execute('select name from dept');   // [['Sales']]
 
-await conn.close();
-await db.stop();
+  await conn.close();
+  await db.stop();
+}
+
+main().catch((err) => { console.error(err); process.exit(1); });
 ```
 
 Each `MockOracle.start()` is an independent database on its own port, so parallel test files do not see each other's data. Connection pools (`oracledb.createPool`) work the same way.
@@ -78,7 +82,7 @@ In `seed` and `runScript`, end SQL statements with `;`. End each PL/SQL block, p
 | `db.connectString` | Easy Connect string for node-oracledb: `localhost:<port>/FREEPDB1`. |
 | `db.runScript(sql)` | Runs SQL statements without a connection and commits them. |
 | `db.snapshot()` | Saves the committed contents of every table and sequence. |
-| `db.restore(snapshot?)` | Puts the data back as it was in `snapshot`, or right after start and seeding when no snapshot is given. |
+| `db.restore(snapshot?)` | Puts the committed data back as it was in `snapshot`, or right after start and seeding when no snapshot is given. It does not discard uncommitted work in open connections, so roll those back or close them first. |
 | `db.stop()` | Stops the server. Returns a promise. |
 
 ### In a test suite
@@ -126,8 +130,10 @@ TypeScript types are included.
 The image is `ghcr.io/bantini/mock-oracle`, built for `linux/amd64` and `linux/arm64`.
 
 ```sh
-docker run --rm -p 1521:1521 ghcr.io/bantini/mock-oracle:0.1
+docker run --rm -p 127.0.0.1:1521:1521 ghcr.io/bantini/mock-oracle:0.1
 ```
+
+The `127.0.0.1:` prefix keeps the port reachable from your machine only. Every user shares one password, `oracle` by default, so if you publish the port on all interfaces (`-p 1521:1521`) on a machine others can reach, set `MOCK_ORACLE_PASSWORD` to something only your clients know.
 
 Then connect with any user name, password `oracle`, and connect string `localhost:1521/FREEPDB1`.
 
@@ -148,7 +154,7 @@ const conn = await oracledb.getConnection({ user: 'test', password: 'oracle', co
 At startup the server runs every `.sql` file in `/docker-entrypoint-initdb.d`, in name order, just like the official Oracle and Postgres images. Mount a folder of scripts there:
 
 ```sh
-docker run --rm -p 1521:1521 -v "$PWD/sql:/docker-entrypoint-initdb.d:ro" ghcr.io/bantini/mock-oracle:0.1
+docker run --rm -p 127.0.0.1:1521:1521 -v "$PWD/sql:/docker-entrypoint-initdb.d:ro" ghcr.io/bantini/mock-oracle:0.1
 ```
 
 ```text
@@ -159,7 +165,7 @@ sql/
                     /
 ```
 
-The same rules as `seed` apply: `;` ends a SQL statement, and a line holding only `/` ends a PL/SQL block. If a script fails, the container exits and prints the file and the ORA- error. Data lives in memory only, so restarting the container gives you the seeded state again.
+The same rules as `seed` apply: `;` ends a SQL statement, and a line holding only `/` ends a PL/SQL block. The port opens only after every script has run, so a client that connects too early gets "connection refused". If a script fails, the container exits and prints the file and the ORA- error. Data lives in memory only, so restarting the container gives you the seeded state again.
 
 ### Settings
 
@@ -170,7 +176,7 @@ The same rules as `seed` apply: `;` ends a SQL statement, and a line holding onl
 | `MOCK_ORACLE_ADDR` | `0.0.0.0:1521` | Address and port to listen on inside the container. |
 | `RUST_LOG` | `info` | Log level: `error`, `warn`, `info`, `debug` or `trace`. |
 
-To expose it on another host port, map it: `-p 1600:1521` and connect to `localhost:1600/FREEPDB1`.
+To expose it on another host port, map it: `-p 127.0.0.1:1600:1521` and connect to `localhost:1600/FREEPDB1`.
 
 ### docker compose
 
@@ -178,7 +184,7 @@ To expose it on another host port, map it: `-p 1600:1521` and connect to `localh
 services:
   oracle:
     image: ghcr.io/bantini/mock-oracle:0.1
-    ports: ['1521:1521']
+    ports: ['127.0.0.1:1521:1521']   # only needed to connect from the host
     environment:
       MOCK_ORACLE_PASSWORD: secret
     volumes:
@@ -194,7 +200,7 @@ Other containers on the same network reach it by service name, here `oracle:1521
 
 ## Use the Docker image in CI
 
-The mock is ready as soon as the container starts, so no health-check wait is needed.
+Without seed scripts the mock accepts connections as soon as the container starts. With seed scripts, the port opens once they have run, so wait for it before the tests start, as below.
 
 **GitHub Actions**
 
@@ -216,11 +222,19 @@ jobs:
           DB_CONNECT_STRING: localhost:1521/FREEPDB1
 ```
 
-Service containers cannot mount files from the checkout, so to seed from your repository start the container in a step instead:
+Service containers cannot mount files from the checkout, so to seed from your repository start the container in a step instead, and wait for the port:
 
 ```yaml
-      - run: docker run -d -p 1521:1521 -v "$PWD/sql:/docker-entrypoint-initdb.d:ro" ghcr.io/bantini/mock-oracle:0.1
+      - name: Start mock-oracle
+        run: |
+          docker run -d --name oracle -p 1521:1521 -v "$PWD/sql:/docker-entrypoint-initdb.d:ro" ghcr.io/bantini/mock-oracle:0.1
+          timeout 60 bash -c 'until (echo > /dev/tcp/127.0.0.1/1521) 2>/dev/null; do
+            docker inspect -f "{{.State.Running}}" oracle | grep -q true || { docker logs oracle; exit 1; }
+            sleep 0.5
+          done'
 ```
+
+If a seed script fails, the container stops and the step prints its log.
 
 **GitLab CI**
 
@@ -236,6 +250,8 @@ test:
     - npm ci
     - npm test
 ```
+
+GitLab waits for a service's exposed port before running `script`, so no extra wait is needed there.
 
 If your tests are written in Node, the npm package is usually simpler than the image in CI: it needs no service container, and each test file gets its own database.
 

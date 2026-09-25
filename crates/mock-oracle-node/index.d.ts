@@ -6,6 +6,8 @@
 export interface StartOptions {
   /** Port to listen on; 0 (the default) picks a free one. */
   port?: number
+  /** Password for every user; defaults to "oracle". */
+  password?: string
 }
 export declare class MockOracle {
   static start(options?: StartOptions | undefined | null): Promise<MockOracle>

@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use mock_oracle_core::Database;
-use mock_oracle_server::Server;
+use mock_oracle_server::{Config, Server, DEFAULT_PASSWORD};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::sync::Mutex;
@@ -14,6 +14,8 @@ use tokio::sync::Mutex;
 pub struct StartOptions {
     /// Port to listen on; 0 (the default) picks a free one.
     pub port: Option<u32>,
+    /// Password for every user; defaults to "oracle".
+    pub password: Option<String>,
 }
 
 #[napi]
@@ -26,10 +28,16 @@ pub struct MockOracle {
 impl MockOracle {
     #[napi(factory)]
     pub async fn start(options: Option<StartOptions>) -> Result<MockOracle> {
-        let port = options.and_then(|o| o.port).unwrap_or(0);
+        let (port, password) = match options {
+            Some(o) => (o.port.unwrap_or(0), o.password),
+            None => (0, None),
+        };
+        let config = Config {
+            password: password.unwrap_or_else(|| DEFAULT_PASSWORD.into()),
+        };
         let port = u16::try_from(port).map_err(|_| Error::from_reason("port must be 0-65535"))?;
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let server = Server::start(addr, Arc::new(Database::new()))
+        let server = Server::start(addr, Arc::new(Database::new()), config)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(MockOracle {

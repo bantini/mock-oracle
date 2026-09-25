@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use mock_oracle_core::Database;
-use mock_oracle_server::Server;
+use mock_oracle_server::{Config, Server, DEFAULT_PASSWORD};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -17,7 +17,9 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .expect("MOCK_ORACLE_ADDR must be host:port");
 
-    let server = Server::start(addr, Arc::new(Database::new())).await?;
+    let password =
+        std::env::var("MOCK_ORACLE_PASSWORD").unwrap_or_else(|_| DEFAULT_PASSWORD.into());
+    let server = Server::start(addr, Arc::new(Database::new()), Config { password }).await?;
     tracing::info!(addr = %server.local_addr(), "mock-oracle listening");
 
     tokio::signal::ctrl_c().await?;

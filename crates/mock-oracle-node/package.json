@@ -8,16 +8,25 @@
   "napi": {
     "name": "mock-oracle",
     "triples": {
-      "additional": ["aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+      "additional": [
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin"
+      ]
     }
   },
-  "files": ["index.js", "index.d.ts", "*.node"],
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
   "scripts": {
     "build": "napi build --platform --release",
-    "build:debug": "napi build --platform"
+    "build:debug": "napi build --platform",
+    "test": "node --test"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.0"
+    "@napi-rs/cli": "^2.18.0",
+    "oracledb": "^6.0.0 || ^7.0.0"
   },
   "engines": {
     "node": ">=18"

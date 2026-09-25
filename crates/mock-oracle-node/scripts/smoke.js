@@ -1,5 +1,5 @@
 // Connects to an already running mock (for example the Docker image) and runs
-// one query. Usage: node test/smoke.js localhost:1521/FREEPDB1
+// one query. Usage: node scripts/smoke.js localhost:1521/FREEPDB1
 const oracledb = require('oracledb');
 
 (async () => {

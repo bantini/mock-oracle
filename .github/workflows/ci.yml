@@ -53,6 +53,6 @@ jobs:
         working-directory: crates/mock-oracle-node
         run: |
           npm install --no-save oracledb
-          node test/smoke.js localhost:1521/FREEPDB1
+          node scripts/smoke.js localhost:1521/FREEPDB1
       - if: failure()
         run: docker logs mock-oracle

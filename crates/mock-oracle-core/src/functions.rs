@@ -671,7 +671,22 @@ impl Ex<'_> {
                 })
             }
             "SYS_GUID" => Err(OraError::new(3001, "unimplemented feature: SYS_GUID")),
-            _ => Err(OraError::invalid_identifier(&format!("\"{name}\""))),
+            _ => {
+                // A stored function. Called from SQL it may read but not change data.
+                let short = name.rsplit('.').next().unwrap_or(name);
+                match self.db.routine(short) {
+                    Some(r) => crate::plsql::exec::call_function(
+                        &mut crate::plsql::exec::QueryHost {
+                            cat: self.cat,
+                            env: self.env,
+                            db: self.db,
+                        },
+                        &r,
+                        args,
+                    ),
+                    None => Err(OraError::invalid_identifier(&format!("\"{name}\""))),
+                }
+            }
         }
     }
 }

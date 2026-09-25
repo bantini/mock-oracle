@@ -19,6 +19,8 @@ pub enum Value {
     Date(NaiveDateTime),
     /// Oracle TIMESTAMP: date and time with fractional seconds, no time zone.
     Timestamp(NaiveDateTime),
+    /// PL/SQL BOOLEAN, also the value of a condition used as an expression.
+    Boolean(bool),
 }
 
 impl Value {
@@ -54,6 +56,7 @@ impl Value {
                 .map(Some)
                 .map_err(|_| OraError::new(1722, "invalid number")),
             Value::Date(_) | Value::Timestamp(_) => Err(OraError::inconsistent("NUMBER", "DATE")),
+            Value::Boolean(_) => Err(OraError::inconsistent("NUMBER", "BOOLEAN")),
         }
     }
 
@@ -64,6 +67,7 @@ impl Value {
             Value::Date(d) | Value::Timestamp(d) => Ok(Some(*d)),
             Value::Varchar2(s) => datetime::parse(s, nls_date_format).map(Some),
             Value::Number(_) => Err(OraError::inconsistent("DATE", "NUMBER")),
+            Value::Boolean(_) => Err(OraError::inconsistent("DATE", "BOOLEAN")),
         }
     }
 }
@@ -79,6 +83,7 @@ impl fmt::Display for Value {
             Value::Timestamp(d) => {
                 f.write_str(&datetime::format(d, datetime::DEFAULT_TIMESTAMP_FORMAT))
             }
+            Value::Boolean(b) => f.write_str(if *b { "TRUE" } else { "FALSE" }),
         }
     }
 }
@@ -88,6 +93,13 @@ impl fmt::Display for Value {
 pub fn compare(a: &Value, b: &Value, nls_date_format: &str) -> Result<Option<Ordering>, OraError> {
     Ok(match (a, b) {
         (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Boolean(x), Value::Boolean(y)) => Some(x.cmp(y)),
+        (Value::Boolean(_), _) | (_, Value::Boolean(_)) => {
+            return Err(OraError::new(
+                6550,
+                "PLS-00306: wrong number or types of arguments in call to '='",
+            ))
+        }
         // Blank-padded comparison, so CHAR columns match unpadded literals.
         (Value::Varchar2(x), Value::Varchar2(y)) => Some(
             x.trim_end_matches(' ')
@@ -131,6 +143,7 @@ pub fn key_string<'a>(values: impl IntoIterator<Item = &'a Value>) -> String {
                     utc.timestamp_subsec_nanos()
                 ));
             }
+            Value::Boolean(b) => key.push(if *b { 'T' } else { 'F' }),
         }
         key.push('\u{1}');
     }

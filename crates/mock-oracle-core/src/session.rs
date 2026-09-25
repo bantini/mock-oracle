@@ -6,9 +6,12 @@ use std::sync::Arc;
 use bigdecimal::RoundingMode;
 
 use crate::ast::*;
+use crate::catalog::SequenceDef;
 use crate::catalog::{Catalog, ConstraintKind, Table, TableColumn};
-use crate::eval::{infer_type, Env, Ex, RelCol, Scope};
-use crate::{datetime, parser, Column, Database, OraError, QueryResult, SqlType, Value};
+use crate::eval::{infer_type, Env, Ex, RelCol, Scope, VarLookup};
+use crate::plsql::exec::{self, Host, Outcome};
+use crate::plsql::Routine;
+use crate::{datetime, parser, Column, Database, OraError, OutBind, QueryResult, SqlType, Value};
 
 /// One change in a transaction, replayed onto the committed state at COMMIT.
 #[derive(Debug, Clone)]
@@ -41,6 +44,13 @@ struct Txn {
     log: Vec<Change>,
 }
 
+/// A point in a session's transaction that later changes can be undone to.
+#[derive(Debug, Clone, Copy)]
+pub struct Savepoint {
+    commits: u64,
+    changes: usize,
+}
+
 /// A connection's view of a [`Database`]. Changes are private to the session until
 /// [`Session::commit`]; dropping the session rolls them back.
 #[derive(Debug)]
@@ -48,6 +58,9 @@ pub struct Session {
     db: Arc<Database>,
     env: Env,
     txn: Option<Txn>,
+    /// Counts commits and rollbacks, so a failed block knows whether it may undo
+    /// changes made before it.
+    commits: u64,
 }
 
 fn unique_violation(user: &str, constraint: &str) -> OraError {
@@ -63,6 +76,7 @@ impl Session {
             db,
             env: Env::new(user),
             txn: None,
+            commits: 0,
         }
     }
 
@@ -80,32 +94,97 @@ impl Session {
         self.env.tz_offset_minutes
     }
 
-    /// Executes one SQL statement. `binds` are the bind values in the order the
-    /// placeholders appear in the statement.
+    /// Executes one SQL statement or PL/SQL block. `binds` are the bind values by
+    /// position (see [`crate::bind_directions`]); values at RETURNING positions are
+    /// ignored.
     pub fn execute(&mut self, sql: &str, binds: &[Value]) -> Result<QueryResult, OraError> {
         let parsed = parser::parse(sql)?;
         if binds.len() < parsed.binds {
             return Err(OraError::new(1008, "not all variables bound"));
         }
         self.env.start_statement();
-        match parsed.stmt {
-            Statement::Query(q) => {
-                let committed;
-                let cat = match &self.txn {
-                    Some(t) => &t.work,
-                    None => {
-                        committed = self.db.committed();
-                        &committed
+        match &parsed.stmt {
+            Statement::Block(block) => {
+                let values = self.block(block, binds[..parsed.binds].to_vec())?;
+                Ok(QueryResult {
+                    out_binds: values.into_iter().map(OutBind::Value).collect(),
+                    ..Default::default()
+                })
+            }
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                let outcome = self.run(&parsed.stmt, binds, None)?;
+                let mut out_binds = Vec::new();
+                if let Some(r) = returning(&parsed.stmt) {
+                    out_binds = vec![OutBind::In; parsed.binds];
+                    for (k, e) in r.into.iter().enumerate() {
+                        if let Expr::Bind(i) = e {
+                            out_binds[*i] = OutBind::Returning(
+                                outcome.rows.iter().map(|row| row[k].clone()).collect(),
+                            );
+                        }
                     }
-                };
+                }
+                Ok(QueryResult {
+                    rows_affected: outcome.rows_affected,
+                    out_binds,
+                    ..Default::default()
+                })
+            }
+            stmt => {
+                let outcome = self.run(stmt, binds, None)?;
+                Ok(QueryResult {
+                    is_query: matches!(stmt, Statement::Query(_)),
+                    columns: outcome.columns,
+                    rows: outcome.rows,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
+    /// Runs an anonymous block as one statement: if it fails, its uncommitted changes
+    /// are undone.
+    fn block(
+        &mut self,
+        block: &crate::plsql::Block,
+        binds: Vec<Value>,
+    ) -> Result<Vec<Value>, OraError> {
+        let savepoint = self.savepoint();
+        let result = exec::run_block(self, block, binds);
+        if result.is_err() {
+            self.rollback_to(savepoint);
+        }
+        result
+    }
+
+    /// The state this session sees: its transaction's, or the committed state.
+    fn catalog(&self) -> std::borrow::Cow<'_, Catalog> {
+        match &self.txn {
+            Some(t) => std::borrow::Cow::Borrowed(&t.work),
+            None => std::borrow::Cow::Owned(self.db.committed()),
+        }
+    }
+
+    /// Runs a statement other than a top-level block.
+    fn run(
+        &mut self,
+        stmt: &Statement,
+        binds: &[Value],
+        vars: Option<&dyn VarLookup>,
+    ) -> Result<Outcome, OraError> {
+        match stmt {
+            Statement::Query(q) => {
+                let cat = self.catalog();
                 let rel = Ex {
-                    cat,
+                    cat: &cat,
                     binds,
                     env: &self.env,
+                    db: &self.db,
+                    vars,
                 }
-                .query(&q, None)?;
-                Ok(QueryResult {
-                    is_query: true,
+                .query(q, None)?;
+                Ok(Outcome {
+                    rows_affected: rel.rows.len() as u64,
                     columns: rel
                         .cols
                         .into_iter()
@@ -115,35 +194,40 @@ impl Session {
                         })
                         .collect(),
                     rows: rel.rows,
-                    rows_affected: 0,
                 })
             }
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
-                let rows_affected = self.dml(&parsed.stmt, binds)?;
-                Ok(QueryResult {
+                let (rows_affected, rows) = self.dml(stmt, binds, vars)?;
+                Ok(Outcome {
                     rows_affected,
-                    ..Default::default()
+                    rows,
+                    columns: Vec::new(),
                 })
             }
-            Statement::Commit => self.commit().map(|_| QueryResult::default()),
+            Statement::Block(block) => {
+                self.block(block, binds.to_vec())?;
+                Ok(Outcome::default())
+            }
+            Statement::Commit => self.commit().map(|_| Outcome::default()),
             Statement::Rollback => {
                 self.rollback();
-                Ok(QueryResult::default())
+                Ok(Outcome::default())
             }
             Statement::AlterSession { name, value } => {
-                self.alter_session(&name, &value)?;
-                Ok(QueryResult::default())
+                self.alter_session(name, value)?;
+                Ok(Outcome::default())
             }
             stmt => {
                 // DDL commits any open transaction first, then changes the committed state directly.
                 self.commit()?;
-                self.ddl(stmt, binds)?;
-                Ok(QueryResult::default())
+                self.ddl(stmt.clone(), binds)?;
+                Ok(Outcome::default())
             }
         }
     }
 
     pub fn commit(&mut self) -> Result<(), OraError> {
+        self.commits += 1;
         let Some(txn) = self.txn.take() else {
             return Ok(());
         };
@@ -192,7 +276,33 @@ impl Session {
         Ok(())
     }
 
+    /// Marks the current point of the transaction, to undo later work with
+    /// [`Session::rollback_to`].
+    pub fn savepoint(&self) -> Savepoint {
+        Savepoint {
+            commits: self.commits,
+            changes: self.txn.as_ref().map_or(0, |t| t.log.len()),
+        }
+    }
+
+    /// Undoes the uncommitted changes made since `savepoint`. Changes committed since
+    /// then stay; only those after the last commit are undone.
+    pub fn rollback_to(&mut self, savepoint: Savepoint) {
+        let keep = if self.commits == savepoint.commits {
+            savepoint.changes
+        } else {
+            0
+        };
+        if let Some(txn) = &mut self.txn {
+            undo(txn, keep.min(txn.log.len()));
+            if txn.log.is_empty() {
+                self.txn = None;
+            }
+        }
+    }
+
     pub fn rollback(&mut self) {
+        self.commits += 1;
         self.txn = None;
     }
 
@@ -217,7 +327,13 @@ impl Session {
 
     // ---- DML ----
 
-    fn dml(&mut self, stmt: &Statement, binds: &[Value]) -> Result<u64, OraError> {
+    /// Runs INSERT, UPDATE or DELETE. Returns the row count and the RETURNING values.
+    fn dml(
+        &mut self,
+        stmt: &Statement,
+        binds: &[Value],
+        vars: Option<&dyn VarLookup>,
+    ) -> Result<(u64, Vec<Vec<Value>>), OraError> {
         let db = self.db.clone();
         let txn = self.txn.get_or_insert_with(|| {
             let work = db.committed();
@@ -229,10 +345,16 @@ impl Session {
         });
         // Statement-level atomicity: a failing statement undoes only its own changes.
         let saved = txn.log.len();
+        let ctx = Dml {
+            db: &db,
+            env: &self.env,
+            binds,
+            vars,
+        };
         let result = match stmt {
-            Statement::Insert(i) => insert(&db, &self.env, txn, i, binds),
-            Statement::Update(u) => update(&self.env, txn, u, binds),
-            Statement::Delete(d) => delete(&self.env, txn, d, binds),
+            Statement::Insert(i) => insert(&ctx, txn, i),
+            Statement::Update(u) => update(&ctx, txn, u),
+            Statement::Delete(d) => delete(&ctx, txn, d),
             _ => unreachable!(),
         };
         if result.is_err() {
@@ -260,6 +382,8 @@ impl Session {
                                 cat: &cat,
                                 binds,
                                 env: &self.env,
+                                db: &self.db,
+                                vars: None,
                             }
                             .query(q, None)?,
                         )
@@ -429,10 +553,189 @@ impl Session {
                 t.constraints.retain(|c| !(c.is_index && c.name == name));
                 state.version += 1;
             }
+            Statement::CreateSequence { name, options } => {
+                let mut state = self.db.state.write().unwrap();
+                if state.name_in_use(&name) {
+                    return Err(OraError::new(
+                        955,
+                        "name is already used by an existing object",
+                    ));
+                }
+                let def = sequence_def(None, &options)?;
+                self.db.set_sequence(&name, None);
+                state.sequences.insert(name, def);
+                state.version += 1;
+            }
+            Statement::AlterSequence { name, options } => {
+                let mut state = self.db.state.write().unwrap();
+                let Some(old) = state.sequences.get(&name).cloned() else {
+                    return Err(OraError::new(2289, "sequence does not exist"));
+                };
+                let def = sequence_def(Some(&old), &options)?;
+                // The next number follows the last one handed out, with the new increment.
+                if let Some(next) = self.db.peek_sequence(&name) {
+                    self.db
+                        .set_sequence(&name, Some(next - old.increment + def.increment));
+                }
+                for o in &options {
+                    if let SequenceOption::Restart(at) = o {
+                        let start = at.unwrap_or(if def.increment > 0 { def.min } else { def.max });
+                        self.db.set_sequence(&name, Some(start));
+                    }
+                }
+                state.sequences.insert(name, def);
+                state.version += 1;
+            }
+            Statement::DropSequence { name } => {
+                let mut state = self.db.state.write().unwrap();
+                if state.sequences.remove(&name).is_none() {
+                    return Err(OraError::new(2289, "sequence does not exist"));
+                }
+                self.db.set_sequence(&name, None);
+                state.version += 1;
+            }
+            Statement::CreateRoutine {
+                routine,
+                or_replace,
+            } => {
+                let mut state = self.db.state.write().unwrap();
+                let replacing = or_replace && state.routines.contains_key(&routine.name);
+                if !replacing && state.name_in_use(&routine.name) {
+                    return Err(OraError::new(
+                        955,
+                        "name is already used by an existing object",
+                    ));
+                }
+                state.routines.insert(routine.name.clone(), routine);
+                state.version += 1;
+            }
+            Statement::DropRoutine { name, function } => {
+                let mut state = self.db.state.write().unwrap();
+                match state.routines.get(&name) {
+                    Some(r) if r.is_function() == function => {
+                        state.routines.remove(&name);
+                        state.version += 1;
+                    }
+                    _ => return Err(OraError::new(4043, format!("object {name} does not exist"))),
+                }
+            }
             _ => unreachable!("not DDL"),
         }
         Ok(())
     }
+}
+
+impl Host for Session {
+    fn env(&self) -> &Env {
+        &self.env
+    }
+
+    fn with_ex<R>(
+        &mut self,
+        binds: &[Value],
+        vars: Option<&dyn VarLookup>,
+        f: impl FnOnce(&Ex) -> R,
+    ) -> R {
+        let cat = self.catalog();
+        f(&Ex {
+            cat: &cat,
+            binds,
+            env: &self.env,
+            db: &self.db,
+            vars,
+        })
+    }
+
+    fn execute(
+        &mut self,
+        stmt: &Statement,
+        binds: &[Value],
+        vars: Option<&dyn VarLookup>,
+    ) -> Result<Outcome, OraError> {
+        self.run(stmt, binds, vars)
+    }
+
+    fn routine(&self, name: &str) -> Option<Arc<Routine>> {
+        self.db.routine(name)
+    }
+}
+
+/// The RETURNING clause of a DML statement.
+fn returning(stmt: &Statement) -> Option<&Returning> {
+    match stmt {
+        Statement::Insert(i) => i.returning.as_ref(),
+        Statement::Update(u) => u.returning.as_ref(),
+        Statement::Delete(d) => d.returning.as_ref(),
+        _ => None,
+    }
+}
+
+/// Applies CREATE or ALTER SEQUENCE options to the defaults or an existing definition.
+fn sequence_def(
+    old: Option<&SequenceDef>,
+    options: &[SequenceOption],
+) -> Result<SequenceDef, OraError> {
+    const MAX: i128 = 9_999_999_999_999_999_999_999_999_999; // 28 nines
+    const MIN: i128 = -999_999_999_999_999_999_999_999_999; // 27 nines
+    let mut increment = old.map_or(1, |d| d.increment);
+    let mut start = None;
+    let mut cycle = old.is_some_and(|d| d.cycle);
+    let mut min_set = old.map(|d| Some(d.min));
+    let mut max_set = old.map(|d| Some(d.max));
+    for o in options {
+        match o {
+            SequenceOption::StartWith(n) => {
+                if old.is_some() {
+                    return Err(OraError::new(2283, "cannot alter starting sequence number"));
+                }
+                start = Some(*n)
+            }
+            SequenceOption::IncrementBy(n) => {
+                if *n == 0 {
+                    return Err(OraError::new(4002, "INCREMENT must be a non-zero integer"));
+                }
+                increment = *n
+            }
+            SequenceOption::MinValue(n) => min_set = Some(*n),
+            SequenceOption::MaxValue(n) => max_set = Some(*n),
+            SequenceOption::Cycle(c) => cycle = *c,
+            SequenceOption::Restart(_) => {}
+        }
+    }
+    let min = min_set
+        .flatten()
+        .unwrap_or(if increment > 0 { 1 } else { MIN });
+    let max = max_set
+        .flatten()
+        .unwrap_or(if increment > 0 { MAX } else { -1 });
+    if min >= max {
+        return Err(OraError::new(4028, "cannot generate internal sequence"));
+    }
+    let start = match old {
+        Some(d) => d.start,
+        None => start.unwrap_or(if increment > 0 { min } else { max }),
+    };
+    if old.is_none() {
+        if start < min {
+            return Err(OraError::new(
+                4006,
+                "START WITH cannot be less than MINVALUE",
+            ));
+        }
+        if start > max {
+            return Err(OraError::new(
+                4008,
+                "START WITH cannot be more than MAXVALUE",
+            ));
+        }
+    }
+    Ok(SequenceDef {
+        start,
+        increment,
+        min,
+        max,
+        cycle,
+    })
 }
 
 /// Reverts the log entries after `keep`, newest first. The rows of one UPDATE are
@@ -508,7 +811,7 @@ fn table_scope_cols(t: &Table, qualifier: &str) -> Vec<RelCol> {
 }
 
 /// Converts a value for storage in a column, enforcing the column's type, length and precision.
-fn store_value(
+pub(crate) fn store_value(
     env: &Env,
     user: &str,
     table: &str,
@@ -517,6 +820,9 @@ fn store_value(
 ) -> Result<Value, OraError> {
     if v.is_null() {
         return Ok(Value::Null);
+    }
+    if let Value::Boolean(_) = v {
+        return Err(OraError::inconsistent(&type_name(col.sql_type), "BOOLEAN"));
     }
     let too_large = |actual: usize, max: u32| {
         OraError::new(
@@ -561,7 +867,7 @@ fn store_value(
                 Value::Number(n) => crate::format_number(n),
                 Value::Date(d) => datetime::format(d, &env.nls_date_format),
                 Value::Timestamp(d) => datetime::format(d, &env.nls_timestamp_format),
-                Value::Null => unreachable!(),
+                Value::Null | Value::Boolean(_) => unreachable!(),
             };
             let s = if let SqlType::Char(n) = col.sql_type {
                 let pad = (n as usize).saturating_sub(s.len());
@@ -591,6 +897,17 @@ fn store_value(
             v => Value::Timestamp(round_fraction(v.to_datetime("")?.unwrap(), p)),
         },
     })
+}
+
+/// The type name Oracle uses in messages.
+pub(crate) fn type_name(t: SqlType) -> String {
+    match t {
+        SqlType::Number { .. } => "NUMBER".into(),
+        SqlType::Varchar2(_) => "VARCHAR2".into(),
+        SqlType::Char(_) => "CHAR".into(),
+        SqlType::Date => "DATE".into(),
+        SqlType::Timestamp(_) => "TIMESTAMP".into(),
+    }
 }
 
 fn round_fraction(d: chrono::NaiveDateTime, precision: u8) -> chrono::NaiveDateTime {
@@ -632,18 +949,51 @@ fn check_row(ex: &Ex, t: &Table, values: &[Value], updating: bool) -> Result<(),
     Ok(())
 }
 
-fn insert(
-    db: &Database,
-    env: &Env,
-    txn: &mut Txn,
-    ins: &Insert,
-    binds: &[Value],
-) -> Result<u64, OraError> {
-    let ex = Ex {
-        cat: &txn.work,
-        binds,
-        env,
+/// What a DML statement runs with.
+struct Dml<'a> {
+    db: &'a Database,
+    env: &'a Env,
+    binds: &'a [Value],
+    vars: Option<&'a dyn VarLookup>,
+}
+
+impl<'a> Dml<'a> {
+    fn ex(&self, cat: &'a Catalog) -> Ex<'a> {
+        Ex {
+            cat,
+            binds: self.binds,
+            env: self.env,
+            db: self.db,
+            vars: self.vars,
+        }
+    }
+}
+
+/// Evaluates RETURNING expressions over the rows a statement changed.
+fn returning_rows(
+    ex: &Ex,
+    returning: &Option<Returning>,
+    cols: &[RelCol],
+    rows: &[&[Value]],
+) -> Result<Vec<Vec<Value>>, OraError> {
+    let Some(r) = returning else {
+        return Ok(Vec::new());
     };
+    rows.iter()
+        .map(|row| {
+            r.exprs
+                .iter()
+                .map(|e| ex.eval(e, &Scope::row(cols, row, None)))
+                .collect()
+        })
+        .collect()
+}
+
+type DmlResult = Result<(u64, Vec<Vec<Value>>), OraError>;
+
+fn insert(ctx: &Dml, txn: &mut Txn, ins: &Insert) -> DmlResult {
+    let (db, env) = (ctx.db, ctx.env);
+    let ex = ctx.ex(&txn.work);
     let t = txn
         .work
         .table(&ins.table)
@@ -665,6 +1015,21 @@ fn insert(
             out
         }
         None => (0..t.columns.len()).collect(),
+    };
+    // Defaults of the columns the statement leaves out.
+    let defaults: Vec<&Expr> = t
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !targets.contains(i))
+        .filter_map(|(_, c)| c.default.as_ref())
+        .collect();
+    // A VALUES list is one row; its sequence values also serve the defaults.
+    let values_row = match &ins.source {
+        InsertSource::Values(exprs) => {
+            Some(ex.start_row(exprs.iter().chain(defaults.iter().copied()))?)
+        }
+        InsertSource::Query(_) => None,
     };
     let sources: Vec<Vec<Value>> = match &ins.source {
         InsertSource::Values(exprs) => {
@@ -693,6 +1058,10 @@ fn insert(
     };
     let mut rows = Vec::with_capacity(sources.len());
     for src in sources {
+        let _row = match values_row {
+            Some(_) => None,
+            None => Some(ex.start_row(defaults.iter().copied())?),
+        };
         let mut values = vec![None; t.columns.len()];
         for (&i, v) in targets.iter().zip(src) {
             values[i] = Some(v);
@@ -713,6 +1082,14 @@ fn insert(
         check_row(&ex, t, &full, false)?;
         rows.push(full);
     }
+    drop(values_row);
+    let cols = table_scope_cols(t, &t.name);
+    let returned = returning_rows(
+        &ex,
+        &ins.returning,
+        &cols,
+        &rows.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+    )?;
     let count = rows.len() as u64;
     let table = txn.work.table_mut(&ins.table).unwrap();
     for values in rows {
@@ -726,7 +1103,7 @@ fn insert(
             values,
         });
     }
-    Ok(count)
+    Ok((count, returned))
 }
 
 /// The ids and values of the rows a WHERE clause selects.
@@ -755,12 +1132,9 @@ fn matching_rows(
     Ok(out)
 }
 
-fn update(env: &Env, txn: &mut Txn, upd: &Update, binds: &[Value]) -> Result<u64, OraError> {
-    let ex = Ex {
-        cat: &txn.work,
-        binds,
-        env,
-    };
+fn update(ctx: &Dml, txn: &mut Txn, upd: &Update) -> DmlResult {
+    let env = ctx.env;
+    let ex = ctx.ex(&txn.work);
     let t = txn
         .work
         .table(&upd.table)
@@ -782,6 +1156,7 @@ fn update(env: &Env, txn: &mut Txn, upd: &Update, binds: &[Value]) -> Result<u64
     let mut changes = Vec::new();
     let mut olds = Vec::new();
     for (id, old) in matching_rows(&ex, t, &cols, &upd.where_)? {
+        let _row = ex.start_row(upd.assignments.iter().map(|(_, e)| e))?;
         let mut new = old.clone();
         for ((_, e), &i) in upd.assignments.iter().zip(&targets) {
             let v = ex.eval(e, &Scope::row(&cols, &old, None))?;
@@ -791,6 +1166,15 @@ fn update(env: &Env, txn: &mut Txn, upd: &Update, binds: &[Value]) -> Result<u64
         changes.push((id, new));
         olds.push(old);
     }
+    let returned = returning_rows(
+        &ex,
+        &upd.returning,
+        &cols,
+        &changes
+            .iter()
+            .map(|(_, v)| v.as_slice())
+            .collect::<Vec<_>>(),
+    )?;
     let count = changes.len() as u64;
     let table = txn.work.table_mut(&upd.table).unwrap();
     table
@@ -804,21 +1188,23 @@ fn update(env: &Env, txn: &mut Txn, upd: &Update, binds: &[Value]) -> Result<u64
             old,
         });
     }
-    Ok(count)
+    Ok((count, returned))
 }
 
-fn delete(env: &Env, txn: &mut Txn, del: &Delete, binds: &[Value]) -> Result<u64, OraError> {
-    let ex = Ex {
-        cat: &txn.work,
-        binds,
-        env,
-    };
+fn delete(ctx: &Dml, txn: &mut Txn, del: &Delete) -> DmlResult {
+    let ex = ctx.ex(&txn.work);
     let t = txn
         .work
         .table(&del.table)
         .ok_or_else(OraError::table_not_found)?;
     let cols = table_scope_cols(t, del.alias.as_deref().unwrap_or(&del.table));
     let rows = matching_rows(&ex, t, &cols, &del.where_)?;
+    let returned = returning_rows(
+        &ex,
+        &del.returning,
+        &cols,
+        &rows.iter().map(|(_, v)| v.as_slice()).collect::<Vec<_>>(),
+    )?;
     let count = rows.len() as u64;
     let table = txn.work.table_mut(&del.table).unwrap();
     for (id, old) in rows {
@@ -829,5 +1215,5 @@ fn delete(env: &Env, txn: &mut Txn, del: &Delete, binds: &[Value]) -> Result<u64
             old,
         });
     }
-    Ok(count)
+    Ok((count, returned))
 }

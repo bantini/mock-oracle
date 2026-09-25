@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use crate::plsql::{Block, Routine};
 use crate::{SqlType, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +26,28 @@ pub enum Statement {
     Truncate {
         name: String,
     },
+    CreateSequence {
+        name: String,
+        options: Vec<SequenceOption>,
+    },
+    AlterSequence {
+        name: String,
+        options: Vec<SequenceOption>,
+    },
+    DropSequence {
+        name: String,
+    },
+    /// `CREATE [OR REPLACE] PROCEDURE` or `FUNCTION`.
+    CreateRoutine {
+        routine: Arc<Routine>,
+        or_replace: bool,
+    },
+    DropRoutine {
+        name: String,
+        function: bool,
+    },
+    /// An anonymous PL/SQL block (`BEGIN`, `DECLARE` or `CALL`).
+    Block(Box<Block>),
     Commit,
     Rollback,
     /// `ALTER SESSION SET name = value`.
@@ -30,6 +55,26 @@ pub enum Statement {
         name: String,
         value: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SequenceOption {
+    StartWith(i128),
+    IncrementBy(i128),
+    /// `MINVALUE n`, or `NOMINVALUE` as `None`.
+    MinValue(Option<i128>),
+    MaxValue(Option<i128>),
+    Cycle(bool),
+    /// `RESTART [START WITH n]` in ALTER SEQUENCE.
+    Restart(Option<i128>),
+}
+
+/// `RETURNING exprs INTO targets` on INSERT, UPDATE and DELETE.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Returning {
+    pub exprs: Vec<Expr>,
+    /// Bind variables, or PL/SQL variables (as column references) inside a block.
+    pub into: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +176,7 @@ pub struct Insert {
     pub table: String,
     pub columns: Option<Vec<String>>,
     pub source: InsertSource,
+    pub returning: Option<Returning>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +191,7 @@ pub struct Update {
     pub alias: Option<String>,
     pub assignments: Vec<(String, Expr)>,
     pub where_: Option<Expr>,
+    pub returning: Option<Returning>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +199,7 @@ pub struct Delete {
     pub table: String,
     pub alias: Option<String>,
     pub where_: Option<Expr>,
+    pub returning: Option<Returning>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -262,4 +310,9 @@ pub enum Expr {
     CountStar,
     Subquery(Box<Query>),
     RowNum,
+    /// `seq.NEXTVAL` or `seq.CURRVAL`.
+    Sequence {
+        name: String,
+        next: bool,
+    },
 }

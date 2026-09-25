@@ -24,7 +24,8 @@ pub struct Token {
 }
 
 const SYMBOLS: &[&str] = &[
-    "||", "<=", ">=", "<>", "!=", "^=", "(", ")", ",", "+", "-", "*", "/", "=", "<", ">", ".", ";",
+    "||", "<=", ">=", "<>", "!=", "^=", "=>", "..", "<<", ">>", "**", "(", ")", ",", "+", "-", "*",
+    "/", "=", "<", ">", ".", ";", "%",
 ];
 
 pub fn tokenize(sql: &str) -> Result<Vec<Token>, OraError> {
@@ -89,7 +90,13 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, OraError> {
         } else if c.is_ascii_digit()
             || (c == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
         {
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            // Digits and one decimal point; `1..10` is a PL/SQL range, not a number.
+            let mut seen_point = false;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_digit()
+                    || (bytes[i] == b'.' && !seen_point && bytes.get(i + 1) != Some(&b'.')))
+            {
+                seen_point |= bytes[i] == b'.';
                 i += 1;
             }
             if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
@@ -106,6 +113,13 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, OraError> {
             }
             tokens.push(Token {
                 tok: Tok::Number(sql[start..i].to_string()),
+                start,
+                end: i,
+            });
+        } else if sql[i..].starts_with(":=") {
+            i += 2;
+            tokens.push(Token {
+                tok: Tok::Symbol(":="),
                 start,
                 end: i,
             });
@@ -170,6 +184,37 @@ mod tests {
                 Tok::Bind("ID".into()),
                 Tok::Ident("FROM".into()),
                 Tok::Ident("DUAL".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_plsql_symbols() {
+        assert_eq!(
+            toks("for i in 1..10 loop x := c%rowcount; p(a => 1.5); end loop"),
+            vec![
+                Tok::Ident("FOR".into()),
+                Tok::Ident("I".into()),
+                Tok::Ident("IN".into()),
+                Tok::Number("1".into()),
+                Tok::Symbol(".."),
+                Tok::Number("10".into()),
+                Tok::Ident("LOOP".into()),
+                Tok::Ident("X".into()),
+                Tok::Symbol(":="),
+                Tok::Ident("C".into()),
+                Tok::Symbol("%"),
+                Tok::Ident("ROWCOUNT".into()),
+                Tok::Symbol(";"),
+                Tok::Ident("P".into()),
+                Tok::Symbol("("),
+                Tok::Ident("A".into()),
+                Tok::Symbol("=>"),
+                Tok::Number("1.5".into()),
+                Tok::Symbol(")"),
+                Tok::Symbol(";"),
+                Tok::Ident("END".into()),
+                Tok::Ident("LOOP".into()),
             ]
         );
     }

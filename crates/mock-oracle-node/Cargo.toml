@@ -1,0 +1,21 @@
+[package]
+name = "mock-oracle-node"
+description = "Node.js binding for mock-oracle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mock-oracle-core.workspace = true
+mock-oracle-server.workspace = true
+napi = { version = "2", default-features = false, features = ["napi6", "tokio_rt"] }
+napi-derive = "2"
+tokio.workspace = true
+
+[build-dependencies]
+napi-build = "2"

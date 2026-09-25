@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/mock-oracle-core", "crates/mock-oracle-server", "crates/mock-oracle-node"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+repository = "https://github.com/bantini/mock-oracle"
+
+[workspace.dependencies]
+mock-oracle-core = { path = "crates/mock-oracle-core" }
+mock-oracle-server = { path = "crates/mock-oracle-server" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

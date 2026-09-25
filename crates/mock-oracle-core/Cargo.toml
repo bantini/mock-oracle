@@ -1,0 +1,10 @@
+[package]
+name = "mock-oracle-core"
+description = "In-memory Oracle SQL and PL/SQL engine for tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,25 @@
+{
+  "name": "mock-oracle",
+  "version": "0.1.0",
+  "description": "In-memory Oracle stand-in for CI that node-oracledb can connect to",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "repository": "github:bantini/mock-oracle",
+  "napi": {
+    "name": "mock-oracle",
+    "triples": {
+      "additional": ["aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+    }
+  },
+  "files": ["index.js", "index.d.ts", "*.node"],
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

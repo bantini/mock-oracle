@@ -1,0 +1,13 @@
+[package]
+name = "mock-oracle-server"
+description = "TNS listener that lets Oracle thin drivers connect to mock-oracle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+mock-oracle-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

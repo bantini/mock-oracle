@@ -6,6 +6,7 @@ members = ["crates/mock-oracle-core", "crates/mock-oracle-server", "crates/mock-
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
+license = "MIT"
 repository = "https://github.com/bantini/mock-oracle"
 
 [workspace.dependencies]

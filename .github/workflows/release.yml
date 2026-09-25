@@ -145,7 +145,7 @@ jobs:
           pattern: binding-*
           path: crates/mock-oracle-node
           merge-multiple: true
-      - run: cp ../../README.md .
+      - run: cp ../../README.md ../../LICENSE .
       - run: npm pack
       - name: Check every binary is in the package
         run: |

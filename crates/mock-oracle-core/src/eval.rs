@@ -1024,7 +1024,11 @@ impl Ex<'_> {
                     .to_string()
                     .parse()
                     .map_err(|_| datetime::out_of_range())?;
-                let secs = if op == BinaryOp::Sub { -secs } else { secs };
+                let secs = if op == BinaryOp::Sub {
+                    secs.checked_neg().ok_or_else(datetime::out_of_range)?
+                } else {
+                    secs
+                };
                 let d = Duration::try_seconds(secs)
                     .and_then(|delta| d.with_nanosecond_zero().checked_add_signed(delta))
                     .filter(|d| (-4713..=9999).contains(&d.year()))

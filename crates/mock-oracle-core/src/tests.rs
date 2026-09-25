@@ -779,6 +779,13 @@ fn scripts() {
 fn hostile_arguments_return_errors_not_panics() {
     let db = db();
     assert_eq!(err(&db, "select date '2024-01-01' + 1e7 from dual"), 1841);
+    assert_eq!(
+        err(
+            &db,
+            "select date '2024-01-01' - (-9223372036854775808 / 86400) from dual"
+        ),
+        1841
+    );
     assert_eq!(err(&db, "select add_months(sysdate, 1e9) from dual"), 1841);
     assert_eq!(
         one(&db, "select substr('hello', 2, 1e20) from dual"),

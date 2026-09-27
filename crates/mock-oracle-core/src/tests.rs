@@ -890,3 +890,111 @@ fn statement_failures_and_empty_transactions() {
         n("4")
     );
 }
+
+#[test]
+fn partitioned_tables() {
+    let db = db();
+    db.run_script(
+        "
+        create table sales (
+            id number primary key,
+            region varchar2(10),
+            sold date not null,
+            amount number(10,2)
+        )
+        partition by range (sold)
+        interval (numtoyminterval(1, 'MONTH'))
+        subpartition by list (region)
+        subpartition template (
+            subpartition s_east values ('EAST'),
+            subpartition s_other values (default)
+        )
+        (
+            partition p2019 values less than (date '2020-01-01') tablespace users,
+            partition p2020 values less than (to_date('2021-01-01', 'YYYY-MM-DD')),
+            partition pmax values less than (maxvalue)
+        )
+        enable row movement;
+        create table regions (code varchar2(10), name varchar2(30))
+            partition by list (code) (
+                partition p_east values ('EAST', 'NE'),
+                partition p_rest values (default)
+            );
+        create table events (id number, payload varchar2(100))
+            partition by hash (id) partitions 8 store in (users);
+        create table events2 partition by hash (id) partitions 4 as select * from events;
+        create index sales_sold_ix on sales (sold) local (partition i1, partition i2, partition i3);
+        create index sales_amt_ix on sales (amount) global partition by range (amount)
+            (partition g1 values less than (100), partition g2 values less than (maxvalue));
+        insert into sales partition (p2019) values (1, 'EAST', date '2019-05-01', 10);
+        insert into sales partition for (date '2020-06-01') (id, region, sold, amount)
+            values (2, 'WEST', date '2020-06-01', 20);
+        insert into sales values (3, 'EAST', date '2022-01-01', 30);
+        ",
+    )
+    .unwrap();
+
+    // A partition-extended name reads and writes the whole table.
+    assert_eq!(
+        one(&db, "select count(*) from sales partition (p2019)"),
+        n("3")
+    );
+    assert_eq!(
+        one(
+            &db,
+            "select sum(s.amount) from sales partition for (date '2020-06-01') s"
+        ),
+        n("60")
+    );
+    assert_eq!(
+        one(
+            &db,
+            "select count(*) from sales subpartition (p2019_s_east) where region = 'EAST'"
+        ),
+        n("2")
+    );
+    assert_eq!(
+        db.execute(
+            "update sales partition (p2020) set amount = amount + 1 where id = 2",
+            &[]
+        )
+        .unwrap()
+        .rows_affected,
+        1
+    );
+    assert_eq!(
+        db.execute("delete from sales partition (pmax) where id = 3", &[])
+            .unwrap()
+            .rows_affected,
+        1
+    );
+    assert_eq!(one(&db, "select amount from sales where id = 2"), n("21"));
+
+    // Partition maintenance is accepted and leaves the rows alone.
+    db.run_script(
+        "
+        alter table sales add partition p2030 values less than (date '2031-01-01');
+        alter table sales drop partition p2019 update global indexes;
+        alter table sales truncate partition p2020;
+        alter table sales split partition pmax at (date '2040-01-01')
+            into (partition p2039, partition pmax);
+        alter table sales merge partitions p2039, pmax into partition pmax;
+        alter table sales rename partition p2030 to p_2030;
+        alter table sales move partition p_2030 tablespace users;
+        alter table sales modify partition p_2030 add subpartition s_west values ('WEST');
+        alter table sales exchange partition p_2030 with table regions;
+        alter table sales set interval (numtoyminterval(3, 'MONTH'));
+        alter table sales disable row movement;
+        alter table events coalesce partition;
+        alter table events add partition;
+        alter index sales_sold_ix rebuild partition i1;
+        alter index sales_amt_ix modify partition g1 unusable;
+        ",
+    )
+    .unwrap();
+    assert_eq!(one(&db, "select count(*) from sales"), n("2"));
+
+    assert_eq!(err(&db, "alter table nope drop partition p1"), 942);
+    assert_eq!(err(&db, "select * from sales partition p2019"), 933);
+    assert_eq!(err(&db, "alter table sales foo bar"), 900);
+}

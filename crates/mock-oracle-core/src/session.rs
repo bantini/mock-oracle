@@ -619,6 +619,14 @@ impl Session {
                     _ => return Err(OraError::new(4043, format!("object {name} does not exist"))),
                 }
             }
+            Statement::PartitionMaintenance { table } => {
+                if let Some(name) = table {
+                    let state = self.db.state.read().unwrap();
+                    if !state.tables.contains_key(&name) {
+                        return Err(OraError::table_not_found());
+                    }
+                }
+            }
             _ => unreachable!("not DDL"),
         }
         Ok(())

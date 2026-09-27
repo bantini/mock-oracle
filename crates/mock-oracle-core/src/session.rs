@@ -1483,16 +1483,15 @@ fn validate_constraint(
             columns,
             primary: true,
             ..
-        } => {
-            if t.rows
-                .values()
-                .any(|r| columns.iter().any(|&i| r[i].is_null()))
-            {
-                return Err(OraError::new(
-                    1449,
-                    "column contains NULL values; cannot alter to NOT NULL",
-                ));
-            }
+        } if t
+            .rows
+            .values()
+            .any(|r| columns.iter().any(|&i| r[i].is_null())) =>
+        {
+            return Err(OraError::new(
+                1449,
+                "column contains NULL values; cannot alter to NOT NULL",
+            ));
         }
         _ => {}
     }

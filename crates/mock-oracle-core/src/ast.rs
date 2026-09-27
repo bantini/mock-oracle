@@ -56,6 +56,12 @@ pub enum Statement {
     Block(Box<Block>),
     Commit,
     Rollback,
+    /// `ALTER TABLE` or `ALTER INDEX` partition maintenance (ADD/DROP/TRUNCATE/SPLIT/MERGE
+    /// PARTITION and the like). Partitioned tables keep their rows as one table, so this only
+    /// checks that the table exists. `table` is `None` for ALTER INDEX.
+    PartitionMaintenance {
+        table: Option<String>,
+    },
     /// `ALTER SESSION SET name = value`.
     AlterSession {
         name: String,

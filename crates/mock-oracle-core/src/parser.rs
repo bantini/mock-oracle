@@ -305,6 +305,44 @@ impl Parser<'_> {
         Ok(())
     }
 
+    /// Skips a partition-extended table name suffix (`PARTITION (p)`, `PARTITION FOR (v)`,
+    /// or the SUBPARTITION forms). Partitioned tables keep their rows as one table, so the
+    /// statement acts on the whole table.
+    fn partition_extension(&mut self) -> Result<(), OraError> {
+        if (self.is_kw("PARTITION") || self.is_kw("SUBPARTITION"))
+            && (self.is_sym_at(1, "(") || self.is_kw_at(1, "FOR"))
+        {
+            self.advance();
+            self.eat_kw("FOR");
+            if !self.is_sym("(") {
+                return Err(missing_left_paren());
+            }
+            self.skip_parens()?;
+        }
+        Ok(())
+    }
+
+    /// After `ALTER TABLE name` or `ALTER INDEX name`: whether the rest is a partitioning
+    /// operation (ADD/DROP/TRUNCATE/SPLIT/MERGE/... PARTITION, SET INTERVAL, ROW MOVEMENT).
+    fn is_partition_op(&self) -> bool {
+        let part = |n| {
+            ["PARTITION", "SUBPARTITION", "PARTITIONS", "SUBPARTITIONS"]
+                .iter()
+                .any(|k| self.is_kw_at(n, k))
+        };
+        part(0)
+            || part(1)
+            || (self.is_kw("MODIFY")
+                && self.is_kw_at(1, "DEFAULT")
+                && self.is_kw_at(2, "ATTRIBUTES"))
+            || (self.is_kw("SET")
+                && ["INTERVAL", "PARTITIONING", "SUBPARTITION"]
+                    .iter()
+                    .any(|k| self.is_kw_at(1, k)))
+            || ((self.is_kw("ENABLE") || self.is_kw("DISABLE")) && self.is_kw_at(1, "ROW"))
+            || (self.is_kw("REBUILD") && part(1))
+    }
+
     // ---- statements ----
 
     fn statement(&mut self) -> Result<Statement, OraError> {
@@ -353,7 +391,23 @@ impl Parser<'_> {
                 let options = self.sequence_options(true)?;
                 Ok(Statement::AlterSequence { name, options })
             }
-            "ALTER" if self.is_kw_at(1, "TABLE") => self.alter_table(),
+            "ALTER" if self.is_kw_at(1, "TABLE") || self.is_kw_at(1, "INDEX") => {
+                let saved = self.pos;
+                let table = self.is_kw_at(1, "TABLE");
+                self.pos += 2;
+                let name = self.object_name()?;
+                if !self.is_partition_op() {
+                    self.pos = saved;
+                    if table {
+                        return self.alter_table();
+                    }
+                    return Err(OraError::new(900, "invalid SQL statement"));
+                }
+                self.skip_rest();
+                Ok(Statement::PartitionMaintenance {
+                    table: table.then_some(name),
+                })
+            }
             "ALTER" if self.is_kw_at(1, "SESSION") => {
                 self.pos += 2;
                 self.expect_kw("SET")?;
@@ -378,6 +432,7 @@ impl Parser<'_> {
         self.advance();
         self.expect_kw("INTO")?;
         let table = self.object_name()?;
+        self.partition_extension()?;
         self.optional_alias()?;
         let columns = if self.is_sym("(") && !self.is_kw_at(1, "SELECT") {
             Some(self.ident_list()?)
@@ -409,6 +464,7 @@ impl Parser<'_> {
     fn update(&mut self) -> Result<Statement, OraError> {
         self.advance();
         let table = self.object_name()?;
+        self.partition_extension()?;
         let alias = self.optional_alias()?;
         self.expect_kw("SET")?;
         let mut assignments = Vec::new();
@@ -447,6 +503,7 @@ impl Parser<'_> {
         self.advance();
         self.eat_kw("FROM");
         let table = self.object_name()?;
+        self.partition_extension()?;
         let alias = self.optional_alias()?;
         let where_ = if self.eat_kw("WHERE") {
             Some(self.expr()?)
@@ -1377,6 +1434,7 @@ impl Parser<'_> {
             });
         }
         let name = self.object_name()?;
+        self.partition_extension()?;
         let alias = self.optional_alias()?;
         Ok(TableFactor::Table { name, alias })
     }

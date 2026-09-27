@@ -65,7 +65,7 @@ jobs:
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
           cargo test --workspace
-          (cd crates/mock-oracle-node && npm ci && npm run build:debug && npm test)
+          (cd crates/mock-oracle-node && npm ci --ignore-scripts && npm run build:debug && npm test)
           cargo llvm-cov report --lcov --output-path lcov.info
       - uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:

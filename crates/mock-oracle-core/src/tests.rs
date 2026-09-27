@@ -669,7 +669,7 @@ fn transactions() {
     // Dropping a session rolls back.
     {
         let mut c = db.session("app");
-        c.execute("delete from dept", &[]).unwrap();
+        c.execute("delete from dept where id >= 30", &[]).unwrap();
     }
     assert_eq!(count(&mut b), n("5"));
 }
@@ -679,7 +679,8 @@ fn snapshot_and_restore() {
     let db = emp();
     let snap = db.snapshot();
     db.execute("delete from emp", &[]).unwrap();
-    db.execute("drop table dept", &[]).unwrap();
+    db.execute("drop table dept cascade constraints", &[])
+        .unwrap();
     db.restore(&snap);
     assert_eq!(one(&db, "select count(*) from emp"), n("4"));
     assert_eq!(one(&db, "select count(*) from dept"), n("3"));
@@ -889,4 +890,263 @@ fn statement_failures_and_empty_transactions() {
         a.execute("select count(*) from dept", &[]).unwrap().rows[0][0],
         n("4")
     );
+}
+
+#[test]
+fn foreign_keys() {
+    let db = emp();
+    let msg = |sql: &str| db.execute(sql, &[]).unwrap_err().to_string();
+    // The inline REFERENCES in emp() gets a system name.
+    let e = msg("insert into emp (id, name, dept_id) values (9, 'X', 99)");
+    assert!(
+        e.starts_with("ORA-02291: integrity constraint (MOCK.SYS_C")
+            && e.ends_with(") violated - parent key not found"),
+        "{e}"
+    );
+    db.execute(
+        "insert into emp (id, name, dept_id) values (9, 'X', null)",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(err(&db, "update emp set dept_id = 99 where id = 1"), 2291);
+    assert_eq!(err(&db, "delete from dept where id = 20"), 2292);
+    assert_eq!(err(&db, "update dept set id = 21 where id = 20"), 2292);
+    assert_eq!(err(&db, "drop table dept"), 2449);
+    assert_eq!(err(&db, "truncate table dept"), 2266);
+    // Unreferenced parents can go, and so can keys another statement leaves in place.
+    db.execute("delete from dept where id = 30", &[]).unwrap();
+    db.execute("update dept set name = 'Eng' where id = 20", &[])
+        .unwrap();
+    assert_eq!(one(&db, "select count(*) from emp"), n("5"));
+
+    // Named, composite, ON DELETE CASCADE and SET NULL, and the referenced key's column order.
+    db.run_script(
+        "
+        create table orders (region varchar2(2), id number, constraint orders_pk primary key (region, id));
+        create table lines (
+            region varchar2(2),
+            order_id number,
+            line number,
+            constraint lines_fk foreign key (order_id, region) references orders (id, region) on delete cascade
+        );
+        create table notes (
+            region varchar2(2),
+            order_id number,
+            text varchar2(20),
+            constraint notes_fk foreign key (region, order_id) references orders on delete set null
+        );
+        insert into orders values ('EU', 1);
+        insert into orders values ('US', 1);
+        insert into lines values ('EU', 1, 1);
+        insert into lines values ('EU', 1, 2);
+        insert into lines values ('US', 1, 1);
+        insert into notes values ('EU', 1, 'a');
+        ",
+    )
+    .unwrap();
+    assert_eq!(
+        msg("insert into lines values ('EU', 2, 1)"),
+        "ORA-02291: integrity constraint (MOCK.LINES_FK) violated - parent key not found"
+    );
+    // A partly NULL foreign key is not checked.
+    db.execute("insert into lines values ('XX', null, 9)", &[])
+        .unwrap();
+    db.execute("delete from orders where region = 'EU'", &[])
+        .unwrap();
+    assert_eq!(one(&db, "select count(*) from lines"), n("2"));
+    assert_eq!(
+        rows(&db, "select region, order_id, text from notes"),
+        vec![vec![Value::Null, Value::Null, s("a")]]
+    );
+
+    // Self reference: a whole tree can go in one statement, a subtree can cascade.
+    db.run_script(
+        "
+        create table node (id number primary key, parent number references node on delete cascade);
+        insert into node values (1, null);
+        insert into node values (2, 1);
+        insert into node values (3, 2);
+        insert into node values (4, null);
+        ",
+    )
+    .unwrap();
+    assert_eq!(err(&db, "insert into node values (5, 42)"), 2291);
+    db.execute("insert into node select 5, 5 from dual", &[])
+        .unwrap();
+    db.execute("delete from node where id = 1", &[]).unwrap();
+    assert_eq!(one(&db, "select count(*) from node"), n("2"));
+    db.execute("truncate table node", &[]).unwrap();
+
+    // A failed statement undoes its cascades too.
+    db.run_script(
+        "
+        create table a (id number primary key);
+        create table b (id number primary key, a_id number references a on delete cascade);
+        create table c (b_id number references b);
+        insert into a values (1);
+        insert into b values (10, 1);
+        insert into c values (10);
+        ",
+    )
+    .unwrap();
+    assert_eq!(err(&db, "delete from a"), 2292);
+    assert_eq!(one(&db, "select count(*) from b"), n("1"));
+    assert_eq!(one(&db, "select count(*) from a"), n("1"));
+
+    // Checks happen per statement inside a transaction, and rollback restores cascaded rows.
+    let mut s1 = db.session("app");
+    s1.execute("delete from c", &[]).unwrap();
+    s1.execute("delete from a", &[]).unwrap();
+    assert_eq!(
+        s1.execute("select count(*) from b", &[]).unwrap().rows[0][0],
+        n("0")
+    );
+    s1.rollback();
+    assert_eq!(one(&db, "select count(*) from b"), n("1"));
+
+    // DDL errors.
+    assert_eq!(err(&db, "create table bad (x number references nope)"), 942);
+    assert_eq!(
+        err(
+            &db,
+            "create table bad (x number references dept (name, id))"
+        ),
+        2256
+    );
+    assert_eq!(
+        err(&db, "create table bad (x varchar2(4) references dept (id))"),
+        2267
+    );
+    assert_eq!(
+        err(
+            &db,
+            "create table bad (x number, y number, foreign key (x, y) references orders (id, id))"
+        ),
+        2270
+    );
+    db.execute("create table nopk (x number)", &[]).unwrap();
+    assert_eq!(
+        err(&db, "create table bad (x number references nopk)"),
+        2268
+    );
+    assert_eq!(
+        err(&db, "create table bad (x number references dept (nope))"),
+        904
+    );
+    // A failed CREATE TABLE leaves nothing behind.
+    assert_eq!(err(&db, "select * from bad"), 942);
+    // UNIQUE keys can be referenced too.
+    db.execute(
+        "create table dept_alias (dept_name varchar2(30) references dept (name))",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(err(&db, "insert into dept_alias values ('Nope')"), 2291);
+    db.execute("insert into dept_alias values ('Sales')", &[])
+        .unwrap();
+    // Constraints declared DISABLE are not enforced.
+    db.execute(
+        "create table off (x number constraint off_fk references dept disable)",
+        &[],
+    )
+    .unwrap();
+    db.execute("insert into off values (99)", &[]).unwrap();
+}
+
+#[test]
+fn alter_table_constraints() {
+    let db = db();
+    db.run_script(
+        "
+        create table p (id number, code varchar2(5));
+        create table ch (id number, p_id number);
+        insert into p values (1, 'a');
+        insert into p values (1, 'b');
+        insert into ch values (1, 7);
+        ",
+    )
+    .unwrap();
+    let msg = |sql: &str| db.execute(sql, &[]).unwrap_err().to_string();
+    assert_eq!(
+        msg("alter table p add constraint p_pk primary key (id)"),
+        "ORA-02437: cannot validate (MOCK.P_PK) - primary key violated"
+    );
+    assert_eq!(
+        err(
+            &db,
+            "alter table ch add foreign key (p_id) references p (id)"
+        ),
+        2270
+    );
+    db.run_script(
+        "
+        delete from p where code = 'b';
+        alter table p add constraint p_pk primary key (id) using index;
+        alter table p add (constraint p_uk unique (code), constraint p_ck check (code <> 'z'));
+        ",
+    )
+    .unwrap();
+    assert_eq!(err(&db, "insert into p values (null, 'q')"), 1400);
+    assert_eq!(
+        msg("alter table ch add constraint ch_fk foreign key (p_id) references p"),
+        "ORA-02298: cannot validate (MOCK.CH_FK) - parent keys not found"
+    );
+    db.execute(
+        "alter table ch add constraint ch_fk foreign key (p_id) references p enable novalidate",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(err(&db, "insert into ch values (2, 8)"), 2291);
+    assert_eq!(
+        err(&db, "alter table p add constraint ch_fk unique (id, code)"),
+        2264
+    );
+
+    // DISABLE turns enforcement off; ENABLE checks the rows again.
+    db.execute("alter table ch disable constraint ch_fk", &[])
+        .unwrap();
+    db.execute("insert into ch values (2, 8)", &[]).unwrap();
+    assert_eq!(err(&db, "alter table ch enable constraint ch_fk"), 2298);
+    db.execute("delete from ch where p_id = 8", &[]).unwrap();
+    db.execute("insert into p values (7, 'c')", &[]).unwrap();
+    db.execute(
+        "alter table ch modify constraint ch_fk enable validate",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(err(&db, "delete from p where id = 7"), 2292);
+    assert_eq!(
+        msg("alter table p disable primary key"),
+        "ORA-02297: cannot disable constraint (MOCK.P_PK) - dependencies exist"
+    );
+    db.execute("alter table p disable constraint p_pk cascade", &[])
+        .unwrap();
+    db.execute("delete from p where id = 7", &[]).unwrap();
+    db.execute("insert into p values (1, 'd')", &[]).unwrap();
+    assert_eq!(err(&db, "alter table p enable constraint p_pk"), 2437);
+    db.execute("delete from p where code = 'd'", &[]).unwrap();
+    db.execute("alter table p enable constraint p_pk", &[])
+        .unwrap();
+    assert_eq!(err(&db, "insert into p values (1, 'e')"), 1);
+    db.execute("alter table p disable constraint p_ck", &[])
+        .unwrap();
+    db.execute("insert into p values (8, 'z')", &[]).unwrap();
+    assert_eq!(err(&db, "alter table p enable constraint p_ck"), 2293);
+    assert_eq!(err(&db, "alter table p enable constraint nope"), 2430);
+
+    // Dropping a referenced key needs CASCADE, which drops the foreign keys with it.
+    // The parent row deleted while the key was disabled left an orphan behind.
+    assert_eq!(err(&db, "alter table ch enable constraint ch_fk"), 2298);
+    db.execute("delete from ch", &[]).unwrap();
+    db.execute("alter table ch enable constraint ch_fk", &[])
+        .unwrap();
+    assert_eq!(err(&db, "alter table p drop primary key"), 2273);
+    assert_eq!(err(&db, "alter table p drop constraint nope"), 2443);
+    db.execute("alter table p drop primary key cascade", &[])
+        .unwrap();
+    db.execute("insert into ch values (3, 99)", &[]).unwrap();
+    db.execute("alter table p drop constraint p_uk", &[])
+        .unwrap();
+    db.execute("insert into p values (9, 'c')", &[]).unwrap();
+    assert_eq!(err(&db, "alter table p add column x number"), 1735);
 }

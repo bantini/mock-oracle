@@ -7,7 +7,7 @@ use bigdecimal::RoundingMode;
 
 use crate::ast::*;
 use crate::catalog::SequenceDef;
-use crate::catalog::{Catalog, ConstraintKind, Table, TableColumn};
+use crate::catalog::{foreign_key, Catalog, Constraint, ConstraintKind, Table, TableColumn};
 use crate::eval::{infer_type, Env, Ex, RelCol, Scope, VarLookup};
 use crate::plsql::exec::{self, Host, Outcome};
 use crate::plsql::Routine;
@@ -356,7 +356,8 @@ impl Session {
             Statement::Update(u) => update(&ctx, txn, u),
             Statement::Delete(d) => delete(&ctx, txn, d),
             _ => unreachable!(),
-        };
+        }
+        .and_then(|r| enforce_foreign_keys(&self.env, txn, saved).map(|_| r));
         if result.is_err() {
             undo(txn, saved);
         }
@@ -432,73 +433,77 @@ impl Session {
                         return Err(OraError::new(957, "duplicate column name"));
                     }
                 }
-                let mut table = Table::new(ct.name.clone(), columns);
-                for c in ct.constraints {
-                    let name = match c.name {
-                        Some(n) => n,
-                        None => self.db.constraint_name(),
-                    };
-                    let resolve =
-                        |table: &Table, cols: &[String]| -> Result<Vec<usize>, OraError> {
-                            cols.iter()
-                                .map(|n| {
-                                    table.column_index(n).ok_or_else(|| {
-                                        OraError::invalid_identifier(&format!("\"{n}\""))
-                                    })
-                                })
-                                .collect()
-                        };
-                    match c.kind {
-                        crate::ast::ConstraintKind::PrimaryKey(cols) => {
-                            if table.has_primary_key() {
-                                return Err(OraError::new(
-                                    2260,
-                                    "table can have only one primary key",
-                                ));
-                            }
-                            let idx = resolve(&table, &cols)?;
-                            for &i in &idx {
-                                table.columns[i].not_null = true;
-                            }
-                            let _ = table.add_unique(name, idx, true, false);
-                        }
-                        crate::ast::ConstraintKind::Unique(cols) => {
-                            let idx = resolve(&table, &cols)?;
-                            let _ = table.add_unique(name, idx, false, false);
-                        }
-                        crate::ast::ConstraintKind::Check(e) => {
-                            table.constraints.push(crate::catalog::Constraint {
-                                name,
-                                kind: ConstraintKind::Check(e),
-                                is_index: false,
-                            })
-                        }
-                        // Foreign keys are accepted but not enforced.
-                        crate::ast::ConstraintKind::ForeignKey { columns, .. } => {
-                            resolve(&table, &columns)?;
-                        }
+                state.tables.insert(
+                    ct.name.clone(),
+                    Arc::new(Table::new(ct.name.clone(), columns)),
+                );
+                // System names follow the declaration order; foreign keys are added last so
+                // that they can reference this table's own keys.
+                let mut constraints: Vec<_> = ct
+                    .constraints
+                    .into_iter()
+                    .map(|mut c| {
+                        c.name.get_or_insert_with(|| self.db.constraint_name());
+                        c
+                    })
+                    .collect();
+                constraints.sort_by_key(|c| {
+                    matches!(c.kind, crate::ast::ConstraintKind::ForeignKey { .. })
+                });
+                for c in constraints {
+                    if let Err(e) = add_constraint(&self.env, &self.db, &mut state, &ct.name, c) {
+                        state.tables.remove(&ct.name);
+                        return Err(e);
                     }
                 }
+                let table = state.table_mut(&ct.name).unwrap();
                 for values in rows {
                     let id = self.db.next_row_id();
-                    table
-                        .insert(id, values)
-                        .map_err(|c| unique_violation(&user, &c))?;
+                    if let Err(c) = table.insert(id, values) {
+                        state.tables.remove(&ct.name);
+                        return Err(unique_violation(&user, &c));
+                    }
                 }
                 self.db.identities.lock().unwrap().remove(&ct.name);
-                state.tables.insert(ct.name, Arc::new(table));
                 state.version += 1;
             }
-            Statement::DropTable { name } => {
+            Statement::DropTable {
+                name,
+                cascade_constraints,
+            } => {
                 let mut state = self.db.state.write().unwrap();
-                if state.tables.remove(&name).is_none() {
+                if !state.tables.contains_key(&name) {
                     return Err(OraError::table_not_found());
                 }
+                let refs: Vec<_> = state
+                    .foreign_keys()
+                    .filter(|f| f.parent == name && f.child != name)
+                    .collect();
+                if !refs.is_empty() && !cascade_constraints {
+                    return Err(OraError::new(
+                        2449,
+                        "unique/primary keys in table referenced by foreign keys",
+                    ));
+                }
+                for f in refs {
+                    let child = state.table_mut(&f.child).unwrap();
+                    child.constraints.retain(|c| c.is_index || c.name != f.name);
+                }
+                state.tables.remove(&name);
                 self.db.identities.lock().unwrap().remove(&name);
                 state.version += 1;
             }
             Statement::Truncate { name } => {
                 let mut state = self.db.state.write().unwrap();
+                if state
+                    .foreign_keys()
+                    .any(|f| f.parent == name && f.child != name && f.enabled)
+                {
+                    return Err(OraError::new(
+                        2266,
+                        "unique/primary keys in table referenced by enabled foreign keys",
+                    ));
+                }
                 state
                     .table_mut(&name)
                     .ok_or_else(OraError::table_not_found)?
@@ -529,14 +534,15 @@ impl Session {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 if unique {
-                    t.add_unique(name, idx, false, true).map_err(|_| {
+                    t.add_unique(name, idx, false, true, true).map_err(|_| {
                         OraError::new(1452, "cannot CREATE UNIQUE INDEX; duplicate keys found")
                     })?;
                 } else {
-                    t.constraints.push(crate::catalog::Constraint {
+                    t.constraints.push(Constraint {
                         name,
                         kind: ConstraintKind::Index,
                         is_index: true,
+                        enabled: true,
                     });
                 }
                 state.version += 1;
@@ -552,6 +558,20 @@ impl Session {
                 let t = state.table_mut(&owner).unwrap();
                 t.constraints.retain(|c| !(c.is_index && c.name == name));
                 state.version += 1;
+            }
+            Statement::AlterTable { name, action } => {
+                // Work on a copy, so that validating a constraint over the existing rows
+                // runs without holding the lock; retry if another session changed the state.
+                loop {
+                    let mut cat = self.db.committed();
+                    alter_table(&self.env, &self.db, &mut cat, &name, &action)?;
+                    let mut state = self.db.state.write().unwrap();
+                    if state.version == cat.version {
+                        cat.version += 1;
+                        *state = cat;
+                        break;
+                    }
+                }
             }
             Statement::CreateSequence { name, options } => {
                 let mut state = self.db.state.write().unwrap();
@@ -925,8 +945,21 @@ fn round_fraction(d: chrono::NaiveDateTime, precision: u8) -> chrono::NaiveDateT
 /// Checks NOT NULL and CHECK constraints for a full row.
 fn check_row(ex: &Ex, t: &Table, values: &[Value], updating: bool) -> Result<(), OraError> {
     let user = &ex.env.user;
-    for (c, v) in t.columns.iter().zip(values) {
-        if c.not_null && v.is_null() {
+    // Primary key columns are NOT NULL while the key is enabled.
+    let key: &[usize] = t
+        .constraints
+        .iter()
+        .find_map(|c| match &c.kind {
+            ConstraintKind::Unique {
+                columns,
+                primary: true,
+                ..
+            } if c.enabled => Some(columns.as_slice()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    for (i, (c, v)) in t.columns.iter().zip(values).enumerate() {
+        if (c.not_null || key.contains(&i)) && v.is_null() {
             let target = format!("(\"{user}\".\"{}\".\"{}\")", t.name, c.name);
             return Err(if updating {
                 OraError::new(1407, format!("cannot update {target} to NULL"))
@@ -936,7 +969,7 @@ fn check_row(ex: &Ex, t: &Table, values: &[Value], updating: bool) -> Result<(),
         }
     }
     let cols = table_scope_cols(t, &t.name);
-    for c in &t.constraints {
+    for c in t.constraints.iter().filter(|c| c.enabled) {
         if let ConstraintKind::Check(e) = &c.kind {
             if ex.eval_bool(e, &Scope::row(&cols, values, None))? == Some(false) {
                 return Err(OraError::new(
@@ -1216,4 +1249,524 @@ fn delete(ctx: &Dml, txn: &mut Txn, del: &Delete) -> DmlResult {
         });
     }
     Ok((count, returned))
+}
+
+// ---- constraints ----
+
+fn resolve_columns(t: &Table, names: &[String]) -> Result<Vec<usize>, OraError> {
+    names
+        .iter()
+        .map(|n| {
+            t.column_index(n)
+                .ok_or_else(|| OraError::invalid_identifier(&format!("\"{n}\"")))
+        })
+        .collect()
+}
+
+/// Which types a foreign key column may pair with.
+fn type_family(t: SqlType) -> u8 {
+    match t {
+        SqlType::Number { .. } => 0,
+        SqlType::Varchar2(_) | SqlType::Char(_) => 1,
+        SqlType::Date => 2,
+        SqlType::Timestamp(_) => 3,
+    }
+}
+
+/// Adds a constraint to `table`, checking the rows already there unless it is disabled or
+/// NOVALIDATE. On failure `cat` may be left half changed, so callers discard it.
+fn add_constraint(
+    env: &Env,
+    db: &Database,
+    cat: &mut Catalog,
+    table: &str,
+    c: crate::ast::TableConstraint,
+) -> Result<(), OraError> {
+    use crate::ast::ConstraintKind as K;
+    let user = &env.user;
+    let name = match c.name {
+        Some(n) => n,
+        None => db.constraint_name(),
+    };
+    if cat
+        .tables
+        .values()
+        .any(|t| t.constraints.iter().any(|k| !k.is_index && k.name == name))
+    {
+        return Err(OraError::new(
+            2264,
+            "name already used by an existing constraint",
+        ));
+    }
+    let t = cat.table(table).ok_or_else(OraError::table_not_found)?;
+    let kind = match c.kind {
+        K::PrimaryKey(cols) => {
+            if t.has_primary_key() {
+                return Err(OraError::new(2260, "table can have only one primary key"));
+            }
+            let idx = resolve_columns(t, &cols)?;
+            if c.enabled && t.rows.values().any(|r| idx.iter().any(|&i| r[i].is_null())) {
+                return Err(OraError::new(
+                    1449,
+                    "column contains NULL values; cannot alter to NOT NULL",
+                ));
+            }
+            cat.table_mut(table)
+                .unwrap()
+                .add_unique(name.clone(), idx, true, false, c.enabled)
+                .map_err(|_| {
+                    OraError::new(
+                        2437,
+                        format!("cannot validate ({user}.{name}) - primary key violated"),
+                    )
+                })?;
+            return Ok(());
+        }
+        K::Unique(cols) => {
+            let idx = resolve_columns(t, &cols)?;
+            cat.table_mut(table)
+                .unwrap()
+                .add_unique(name.clone(), idx, false, false, c.enabled)
+                .map_err(|_| {
+                    OraError::new(
+                        2299,
+                        format!("cannot validate ({user}.{name}) - duplicate keys found"),
+                    )
+                })?;
+            return Ok(());
+        }
+        K::Check(e) => ConstraintKind::Check(e),
+        K::ForeignKey {
+            columns,
+            table: parent,
+            ref_columns,
+            on_delete,
+        } => {
+            let idx = resolve_columns(t, &columns)?;
+            let p = cat.table(&parent).ok_or_else(OraError::table_not_found)?;
+            let refs = if ref_columns.is_empty() {
+                p.constraints
+                    .iter()
+                    .find_map(|k| match &k.kind {
+                        ConstraintKind::Unique {
+                            columns,
+                            primary: true,
+                            ..
+                        } => Some(columns.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        OraError::new(2268, "referenced table does not have a primary key")
+                    })?
+            } else {
+                resolve_columns(p, &ref_columns)?
+            };
+            if refs.len() != idx.len() {
+                return Err(OraError::new(
+                    2256,
+                    "number of referencing columns must match referenced columns",
+                ));
+            }
+            // The referenced columns must be exactly those of a primary key or unique
+            // constraint, in any order.
+            let key = p
+                .constraints
+                .iter()
+                .filter(|k| !k.is_index)
+                .find_map(|k| match &k.kind {
+                    ConstraintKind::Unique { columns, .. }
+                        if columns.len() == refs.len()
+                            && columns.iter().all(|c| refs.contains(c)) =>
+                    {
+                        Some(columns.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    OraError::new(
+                        2270,
+                        "no matching unique or primary key for this column-list",
+                    )
+                })?;
+            // Line this table's columns up with the key's column order.
+            let columns: Vec<usize> = key
+                .iter()
+                .map(|k| idx[refs.iter().position(|r| r == k).unwrap()])
+                .collect();
+            for (&c, &k) in columns.iter().zip(&key) {
+                if type_family(t.columns[c].sql_type) != type_family(p.columns[k].sql_type) {
+                    return Err(OraError::new(
+                        2267,
+                        "column type incompatible with referenced column type",
+                    ));
+                }
+            }
+            ConstraintKind::ForeignKey {
+                columns,
+                parent,
+                parent_columns: key,
+                on_delete,
+            }
+        }
+    };
+    let t = cat.table_mut(table).unwrap();
+    t.constraints.push(Constraint {
+        name,
+        kind,
+        is_index: false,
+        enabled: c.enabled,
+    });
+    let i = t.constraints.len() - 1;
+    if c.enabled && c.validate {
+        validate_constraint(env, db, cat, table, i)?;
+    }
+    Ok(())
+}
+
+/// Checks the rows already in `table` against its CHECK or FOREIGN KEY constraint at
+/// position `i`.
+fn validate_constraint(
+    env: &Env,
+    db: &Database,
+    cat: &Catalog,
+    table: &str,
+    i: usize,
+) -> Result<(), OraError> {
+    let t = cat.table(table).unwrap();
+    let c = &t.constraints[i];
+    let cannot = |code: u32, why: &str| {
+        OraError::new(
+            code,
+            format!("cannot validate ({}.{}) - {why}", env.user, c.name),
+        )
+    };
+    match &c.kind {
+        ConstraintKind::Check(e) => {
+            let ex = Ex {
+                cat,
+                binds: &[],
+                env,
+                db,
+                vars: None,
+            };
+            let cols = table_scope_cols(t, &t.name);
+            for r in t.rows.values() {
+                if ex.eval_bool(e, &Scope::row(&cols, r, None))? == Some(false) {
+                    return Err(cannot(2293, "check constraint violated"));
+                }
+            }
+        }
+        ConstraintKind::ForeignKey {
+            columns,
+            parent,
+            parent_columns,
+            ..
+        } => {
+            let p = cat.table(parent).ok_or_else(OraError::table_not_found)?;
+            for r in t.rows.values() {
+                if let Some(k) = foreign_key(columns, r) {
+                    if !p.has_key(parent_columns, &k) {
+                        return Err(cannot(2298, "parent keys not found"));
+                    }
+                }
+            }
+        }
+        ConstraintKind::Unique {
+            columns,
+            primary: true,
+            ..
+        } => {
+            if t.rows
+                .values()
+                .any(|r| columns.iter().any(|&i| r[i].is_null()))
+            {
+                return Err(OraError::new(
+                    1449,
+                    "column contains NULL values; cannot alter to NOT NULL",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The position of a table's constraint by name, or of its primary key when `name` is `None`.
+fn find_constraint(t: &Table, name: Option<&str>) -> Option<usize> {
+    t.constraints.iter().position(|c| {
+        !c.is_index
+            && match name {
+                Some(n) => c.name == n,
+                None => matches!(c.kind, ConstraintKind::Unique { primary: true, .. }),
+            }
+    })
+}
+
+/// Applies an ALTER TABLE constraint change to `cat`.
+fn alter_table(
+    env: &Env,
+    db: &Database,
+    cat: &mut Catalog,
+    table: &str,
+    action: &AlterTableAction,
+) -> Result<(), OraError> {
+    let user = &env.user;
+    let t = cat.table(table).ok_or_else(OraError::table_not_found)?;
+    match action {
+        AlterTableAction::AddConstraints(cs) => {
+            for c in cs {
+                add_constraint(env, db, cat, table, c.clone())?;
+            }
+        }
+        AlterTableAction::DropConstraint { name, cascade } => {
+            let i = find_constraint(t, name.as_deref()).ok_or_else(|| match name {
+                Some(_) => OraError::new(2443, "Cannot drop constraint  - nonexistent constraint"),
+                None => OraError::new(2441, "Cannot drop nonexistent primary key"),
+            })?;
+            if let ConstraintKind::Unique { columns, .. } = &t.constraints[i].kind {
+                let refs = cat.referencing(table, columns);
+                if !refs.is_empty() && !cascade {
+                    return Err(OraError::new(
+                        2273,
+                        "this unique/primary key is referenced by some foreign keys",
+                    ));
+                }
+                for f in refs {
+                    let child = cat.table_mut(&f.child).unwrap();
+                    child.constraints.retain(|c| c.is_index || c.name != f.name);
+                }
+            }
+            let t = cat.table_mut(table).unwrap();
+            let name = t.constraints[i].name.clone();
+            t.constraints.retain(|c| c.is_index || c.name != name);
+        }
+        AlterTableAction::SetConstraint {
+            name,
+            enabled,
+            validate,
+            cascade,
+        } => {
+            let i = find_constraint(t, name.as_deref()).ok_or_else(|| match name {
+                Some(name) => {
+                    let what = if *enabled {
+                        (2430, "enable")
+                    } else {
+                        (2431, "disable")
+                    };
+                    OraError::new(
+                        what.0,
+                        format!(
+                            "cannot {} constraint ({user}.{name}) - no such constraint",
+                            what.1
+                        ),
+                    )
+                }
+                None => OraError::new(
+                    2432,
+                    "cannot enable primary key - primary key not defined for table",
+                ),
+            })?;
+            let name = t.constraints[i].name.clone();
+            if !enabled {
+                if let ConstraintKind::Unique { columns, .. } = &t.constraints[i].kind {
+                    let refs: Vec<_> = cat
+                        .referencing(table, columns)
+                        .into_iter()
+                        .filter(|f| f.enabled)
+                        .collect();
+                    if !refs.is_empty() && !cascade {
+                        return Err(OraError::new(
+                            2297,
+                            format!(
+                                "cannot disable constraint ({user}.{name}) - dependencies exist"
+                            ),
+                        ));
+                    }
+                    for f in refs {
+                        let child = cat.table_mut(&f.child).unwrap();
+                        let j = child
+                            .constraints
+                            .iter()
+                            .position(|c| !c.is_index && c.name == f.name)
+                            .unwrap();
+                        let _ = child.set_enabled(j, false);
+                    }
+                }
+            }
+            let t = cat.table_mut(table).unwrap();
+            let primary = matches!(
+                t.constraints[i].kind,
+                ConstraintKind::Unique { primary: true, .. }
+            );
+            let was_enabled = t.constraints[i].enabled;
+            t.set_enabled(i, *enabled).map_err(|_| {
+                let why = if primary {
+                    (2437, "primary key violated")
+                } else {
+                    (2299, "duplicate keys found")
+                };
+                OraError::new(
+                    why.0,
+                    format!("cannot validate ({user}.{name}) - {}", why.1),
+                )
+            })?;
+            if *enabled && (*validate || primary) && !was_enabled {
+                validate_constraint(env, db, cat, table, i)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Enforces the foreign keys after a DML statement, whose changes start at `from` in the
+/// log. Removed parent keys fail (ORA-02292) or cascade to their child rows; new or
+/// changed child rows need an existing parent key (ORA-02291). Checking once the whole
+/// statement has run lets one statement insert or delete a parent together with its
+/// children, as Oracle does.
+fn enforce_foreign_keys(env: &Env, txn: &mut Txn, from: usize) -> Result<(), OraError> {
+    let user = &env.user;
+    let fks: Vec<_> = txn.work.foreign_keys().filter(|f| f.enabled).collect();
+    if fks.is_empty() {
+        return Ok(());
+    }
+    let violated = |code: u32, name: &str, why: &str| {
+        OraError::new(
+            code,
+            format!("integrity constraint ({user}.{name}) violated - {why}"),
+        )
+    };
+    // Parent side. Cascaded deletes remove further keys, so this runs in rounds over
+    // the changes the previous round logged.
+    let mut start = from;
+    while start < txn.log.len() {
+        let end = txn.log.len();
+        for f in &fks {
+            let mut deleted = HashSet::new();
+            let mut updated = HashSet::new();
+            for change in &txn.log[start..end] {
+                match change {
+                    Change::Delete { table, old, .. } if *table == f.parent => {
+                        deleted.extend(foreign_key(&f.parent_columns, old));
+                    }
+                    Change::Update {
+                        table, old, values, ..
+                    } if *table == f.parent => {
+                        let old = foreign_key(&f.parent_columns, old);
+                        if old.is_some() && old != foreign_key(&f.parent_columns, values) {
+                            updated.extend(old);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // A key another row still holds is still there for its children.
+            let parent = txn.work.table(&f.parent).unwrap();
+            deleted.retain(|k| !parent.has_key(&f.parent_columns, k));
+            updated.retain(|k| !parent.has_key(&f.parent_columns, k));
+            if deleted.is_empty() && updated.is_empty() {
+                continue;
+            }
+            let child = txn.work.table(&f.child).unwrap();
+            let mut hits = Vec::new();
+            for (id, row) in &child.rows {
+                if let Some(k) = foreign_key(&f.columns, row) {
+                    if updated.contains(&k) {
+                        return Err(violated(2292, &f.name, "child record found"));
+                    }
+                    if deleted.contains(&k) {
+                        hits.push((*id, row.clone()));
+                    }
+                }
+            }
+            if hits.is_empty() {
+                continue;
+            }
+            match f.on_delete {
+                OnDelete::Restrict => {
+                    return Err(violated(2292, &f.name, "child record found"));
+                }
+                OnDelete::Cascade => {
+                    let child = txn.work.table_mut(&f.child).unwrap();
+                    for (id, old) in hits {
+                        child.delete(id);
+                        txn.log.push(Change::Delete {
+                            table: f.child.clone(),
+                            id,
+                            old,
+                        });
+                    }
+                }
+                OnDelete::SetNull => {
+                    let key: &[usize] = child
+                        .constraints
+                        .iter()
+                        .find_map(|c| match &c.kind {
+                            ConstraintKind::Unique {
+                                columns,
+                                primary: true,
+                                ..
+                            } if c.enabled => Some(columns.as_slice()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    for &c in &f.columns {
+                        if child.columns[c].not_null || key.contains(&c) {
+                            return Err(OraError::new(
+                                1407,
+                                format!(
+                                    "cannot update (\"{user}\".\"{}\".\"{}\") to NULL",
+                                    child.name, child.columns[c].name
+                                ),
+                            ));
+                        }
+                    }
+                    let changes: Vec<_> = hits
+                        .iter()
+                        .map(|(id, old)| {
+                            let mut new = old.clone();
+                            for &c in &f.columns {
+                                new[c] = Value::Null;
+                            }
+                            (*id, new)
+                        })
+                        .collect();
+                    txn.work
+                        .table_mut(&f.child)
+                        .unwrap()
+                        .update(changes.clone())
+                        .map_err(|c| unique_violation(user, &c))?;
+                    for ((id, values), (_, old)) in changes.into_iter().zip(hits) {
+                        txn.log.push(Change::Update {
+                            table: f.child.clone(),
+                            id,
+                            values,
+                            old,
+                        });
+                    }
+                }
+            }
+        }
+        start = end;
+    }
+    // Child side: each row the statement inserted or changed needs its parent key.
+    for change in &txn.log[from..] {
+        let (Change::Insert { table, id, .. } | Change::Update { table, id, .. }) = change else {
+            continue;
+        };
+        let Some(row) = txn.work.table(table).and_then(|t| t.rows.get(id)) else {
+            continue;
+        };
+        for f in fks.iter().filter(|f| f.child == *table) {
+            if let Some(k) = foreign_key(&f.columns, row) {
+                let found = txn
+                    .work
+                    .table(&f.parent)
+                    .is_some_and(|p| p.has_key(&f.parent_columns, &k));
+                if !found {
+                    return Err(violated(2291, &f.name, "parent key not found"));
+                }
+            }
+        }
+    }
+    Ok(())
 }

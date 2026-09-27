@@ -89,6 +89,17 @@ test('constraint violations raise the Oracle errors', async () => {
   await assert.rejects(conn.execute('select nope from emp'), { errorNum: 904 });
 });
 
+test('foreign keys are enforced', async () => {
+  await assert.rejects(conn.execute("insert into emp (name, dept_id) values ('X', 99)"), {
+    errorNum: 2291,
+    message: /^ORA-02291: integrity constraint \(APP\.SYS_C\d+\) violated - parent key not found/,
+  });
+  await assert.rejects(conn.execute('delete from dept where id = 10'), { errorNum: 2292 });
+  await conn.execute('delete from emp where dept_id = 10');
+  const r = await conn.execute('delete from dept where id = 10');
+  assert.equal(r.rowsAffected, 1);
+});
+
 test('uncommitted changes are private to the connection until commit', async () => {
   const other = await connect();
   try {
@@ -164,6 +175,7 @@ test('JavaScript dates round-trip through DATE and TIMESTAMP columns', async () 
 test('snapshot and restore', async () => {
   await conn.execute("insert into dept values (70, 'Kept')", [], { autoCommit: true });
   const snap = db.snapshot();
+  await conn.execute('delete from emp', [], { autoCommit: true });
   await conn.execute('delete from dept', [], { autoCommit: true });
   db.restore(snap);
   let r = await conn.execute('select count(*) from dept');

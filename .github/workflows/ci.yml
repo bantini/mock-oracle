@@ -40,6 +40,33 @@ jobs:
       - run: npm run build:debug
       - run: npm test
 
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Instrument both the Rust tests and the Node addon, so code reached
+      # through node-oracledb over the wire protocol counts too.
+      - name: Run tests with coverage
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo test --workspace
+          (cd crates/mock-oracle-node && npm ci && npm run build:debug && npm test)
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+
   docker:
     runs-on: ubuntu-latest
     steps:

@@ -12,6 +12,12 @@ pub enum Statement {
     CreateTable(CreateTable),
     DropTable {
         name: String,
+        /// `CASCADE CONSTRAINTS`: also drop the foreign keys that reference the table.
+        cascade_constraints: bool,
+    },
+    AlterTable {
+        name: String,
+        action: AlterTableAction,
     },
     /// Only unique indexes have an effect: they enforce uniqueness like a UNIQUE constraint.
     CreateIndex {
@@ -227,10 +233,42 @@ pub struct ColumnDef {
     pub identity: bool,
 }
 
+/// The constraint forms of `ALTER TABLE`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTableAction {
+    /// `ADD CONSTRAINT ...` or `ADD (constraint, ...)`.
+    AddConstraints(Vec<TableConstraint>),
+    /// `DROP CONSTRAINT name`, or `DROP PRIMARY KEY` when `name` is `None`.
+    DropConstraint { name: Option<String>, cascade: bool },
+    /// `ENABLE`/`DISABLE CONSTRAINT name`, or `MODIFY CONSTRAINT name ENABLE`/`DISABLE`;
+    /// `name` is `None` for `ENABLE`/`DISABLE PRIMARY KEY`.
+    SetConstraint {
+        name: Option<String>,
+        enabled: bool,
+        /// `ENABLE NOVALIDATE` skips checking the rows already in the table.
+        validate: bool,
+        /// `DISABLE ... CASCADE` also disables foreign keys that depend on a key.
+        cascade: bool,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableConstraint {
     pub name: Option<String>,
     pub kind: ConstraintKind,
+    /// `DISABLE` creates the constraint without enforcing it.
+    pub enabled: bool,
+    /// `ENABLE NOVALIDATE` enforces it for new changes only, not for existing rows.
+    pub validate: bool,
+}
+
+/// What deleting a parent row does to the child rows that reference it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDelete {
+    /// The delete fails while child rows exist (ORA-02292).
+    Restrict,
+    Cascade,
+    SetNull,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,11 +276,13 @@ pub enum ConstraintKind {
     PrimaryKey(Vec<String>),
     Unique(Vec<String>),
     Check(Expr),
-    /// Parsed and kept, but not enforced yet.
+    /// `ref_columns` is empty when the statement names only the table: the parent's
+    /// primary key is meant.
     ForeignKey {
         columns: Vec<String>,
         table: String,
         ref_columns: Vec<String>,
+        on_delete: OnDelete,
     },
 }
 

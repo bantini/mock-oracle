@@ -615,3 +615,42 @@ fn dbms_output_limit_counts_only_buffered_bytes() {
         &[],
     );
 }
+
+#[test]
+fn foreign_key_errors_in_blocks() {
+    let db = db();
+    db.run_script(
+        "
+        create table p (id number primary key);
+        create table c (p_id number constraint c_fk references p);
+        insert into p values (1);
+        insert into c values (1);
+        ",
+    )
+    .unwrap();
+    let mut session = db.session("app");
+    let r = block(
+        &mut session,
+        "declare
+            child_found exception;
+            pragma exception_init(child_found, -2292);
+        begin
+            begin
+                delete from p where id = 1;
+                :r := 'deleted';
+            exception
+                when child_found then :r := 'kept';
+            end;
+            insert into c values (2);
+        exception
+            when others then :r := :r || ' ' || sqlcode;
+        end;",
+        &[Value::Null],
+    );
+    assert_eq!(r, vec![s("kept -2291")]);
+    assert_eq!(one(&db, "select count(*) from p"), n(1));
+    assert_eq!(
+        err(&mut session, "begin delete from p; end;", &[]).code,
+        2292
+    );
+}

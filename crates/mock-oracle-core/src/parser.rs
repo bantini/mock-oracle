@@ -398,6 +398,9 @@ impl Parser<'_> {
                 let name = self.object_name()?;
                 if !self.is_partition_op() {
                     self.pos = saved;
+                    if table {
+                        return self.alter_table();
+                    }
                     return Err(OraError::new(900, "invalid SQL statement"));
                 }
                 self.skip_rest();
@@ -554,8 +557,12 @@ impl Parser<'_> {
         self.advance();
         if self.eat_kw("TABLE") {
             let name = self.object_name()?;
-            self.skip_rest(); // CASCADE CONSTRAINTS, PURGE
-            return Ok(Statement::DropTable { name });
+            let cascade_constraints = self.eat_kw("CASCADE");
+            self.skip_rest(); // CONSTRAINTS, PURGE
+            return Ok(Statement::DropTable {
+                name,
+                cascade_constraints,
+            });
         }
         if self.eat_kw("INDEX") {
             let name = self.object_name()?;
@@ -790,35 +797,14 @@ impl Parser<'_> {
                 self.expect_kw("NULL")?;
                 col.not_null = true;
             } else if self.eat_kw("NULL") {
-            } else if self.eat_kw("PRIMARY") {
-                self.expect_kw("KEY")?;
-                constraints.push(TableConstraint {
-                    name: cname,
-                    kind: ConstraintKind::PrimaryKey(vec![name.clone()]),
-                });
-            } else if self.eat_kw("UNIQUE") {
-                constraints.push(TableConstraint {
-                    name: cname,
-                    kind: ConstraintKind::Unique(vec![name.clone()]),
-                });
-            } else if self.eat_kw("CHECK") {
-                self.expect_sym("(")?;
-                let e = self.expr()?;
-                self.expect_sym(")")?;
-                constraints.push(TableConstraint {
-                    name: cname,
-                    kind: ConstraintKind::Check(e),
-                });
-            } else if self.eat_kw("REFERENCES") {
-                let (table, ref_columns) = self.references()?;
-                constraints.push(TableConstraint {
-                    name: cname,
-                    kind: ConstraintKind::ForeignKey {
-                        columns: vec![name.clone()],
-                        table,
-                        ref_columns,
-                    },
-                });
+            } else if self.is_kw("PRIMARY")
+                || self.is_kw("UNIQUE")
+                || self.is_kw("CHECK")
+                || self.is_kw("REFERENCES")
+            {
+                let kind = self.constraint_kind(Some(name.as_str()))?;
+                constraints.push(self.constraint_state(cname, kind)?);
+                continue;
             } else if cname.is_some() {
                 return Err(OraError::new(
                     2253,
@@ -827,28 +813,122 @@ impl Parser<'_> {
             } else {
                 break;
             }
-            if !self.eat_kw("ENABLE") {
-                self.eat_kw("DISABLE");
-            }
+            self.constraint_state(None, ConstraintKind::Unique(Vec::new()))?;
         }
         Ok((col, constraints))
     }
 
-    fn references(&mut self) -> Result<(String, Vec<String>), OraError> {
-        let table = self.object_name()?;
-        let cols = if self.is_sym("(") {
-            self.ident_list()?
-        } else {
-            Vec::new()
+    /// A constraint body. `column` is set for an inline (column) constraint, which names
+    /// no columns of its own.
+    fn constraint_kind(&mut self, column: Option<&str>) -> Result<ConstraintKind, OraError> {
+        let columns = |p: &mut Self| match column {
+            Some(c) => Ok(vec![c.to_string()]),
+            None => p.ident_list(),
         };
-        if self.eat_kw("ON") {
-            self.expect_kw("DELETE")?;
-            if !self.eat_kw("CASCADE") {
-                self.expect_kw("SET")?;
-                self.expect_kw("NULL")?;
+        Ok(if self.eat_kw("PRIMARY") {
+            self.expect_kw("KEY")?;
+            ConstraintKind::PrimaryKey(columns(self)?)
+        } else if self.eat_kw("UNIQUE") {
+            ConstraintKind::Unique(columns(self)?)
+        } else if self.eat_kw("CHECK") {
+            self.expect_sym("(")?;
+            let e = self.expr()?;
+            self.expect_sym(")")?;
+            ConstraintKind::Check(e)
+        } else if column.is_some() && self.eat_kw("REFERENCES") || self.eat_kw("FOREIGN") {
+            let columns = match column {
+                Some(c) => vec![c.to_string()],
+                None => {
+                    self.expect_kw("KEY")?;
+                    let cols = self.ident_list()?;
+                    self.expect_kw("REFERENCES")?;
+                    cols
+                }
+            };
+            let table = self.object_name()?;
+            let ref_columns = if self.is_sym("(") {
+                self.ident_list()?
+            } else {
+                Vec::new()
+            };
+            let mut on_delete = OnDelete::Restrict;
+            if self.eat_kw("ON") {
+                self.expect_kw("DELETE")?;
+                on_delete = if self.eat_kw("CASCADE") {
+                    OnDelete::Cascade
+                } else {
+                    self.expect_kw("SET")?;
+                    self.expect_kw("NULL")?;
+                    OnDelete::SetNull
+                };
+            }
+            ConstraintKind::ForeignKey {
+                columns,
+                table,
+                ref_columns,
+                on_delete,
+            }
+        } else {
+            return Err(OraError::new(
+                2253,
+                "constraint specification not allowed here",
+            ));
+        })
+    }
+
+    /// Reads the state clauses after a constraint (ENABLE, DISABLE, NOVALIDATE,
+    /// DEFERRABLE, USING INDEX, ...). Deferrable constraints are checked immediately.
+    fn constraint_state(
+        &mut self,
+        name: Option<String>,
+        kind: ConstraintKind,
+    ) -> Result<TableConstraint, OraError> {
+        let mut c = TableConstraint {
+            name,
+            kind,
+            enabled: true,
+            validate: true,
+        };
+        let mut validate = None;
+        loop {
+            if self.eat_kw("ENABLE") {
+                c.enabled = true;
+            } else if self.eat_kw("DISABLE") {
+                c.enabled = false;
+            } else if self.eat_kw("VALIDATE") {
+                validate = Some(true);
+            } else if self.eat_kw("NOVALIDATE") {
+                validate = Some(false);
+            } else if self.eat_kw("INITIALLY") {
+                if !self.eat_kw("IMMEDIATE") {
+                    self.expect_kw("DEFERRED")?;
+                }
+            } else if self.is_kw("NOT") && self.is_kw_at(1, "DEFERRABLE") {
+                self.pos += 2;
+            } else if self.eat_kw("DEFERRABLE") || self.eat_kw("RELY") || self.eat_kw("NORELY") {
+            } else if self.is_kw("USING") && self.is_kw_at(1, "INDEX") {
+                self.pos += 2;
+                if self.is_sym("(") {
+                    self.skip_parens()?;
+                } else {
+                    // An index name, or physical attributes, up to the next clause.
+                    while self.peek().is_some()
+                        && !self.is_sym(",")
+                        && !self.is_sym(")")
+                        && !["ENABLE", "DISABLE", "VALIDATE", "NOVALIDATE", "CONSTRAINT"]
+                            .iter()
+                            .any(|k| self.is_kw(k))
+                    {
+                        self.advance();
+                    }
+                }
+            } else {
+                break;
             }
         }
-        Ok((table, cols))
+        // Oracle's defaults: ENABLE means VALIDATE, DISABLE means NOVALIDATE.
+        c.validate = validate.unwrap_or(c.enabled);
+        Ok(c)
     }
 
     fn table_constraint(&mut self) -> Result<TableConstraint, OraError> {
@@ -857,36 +937,93 @@ impl Parser<'_> {
         } else {
             None
         };
-        let kind = if self.eat_kw("PRIMARY") {
-            self.expect_kw("KEY")?;
-            ConstraintKind::PrimaryKey(self.ident_list()?)
-        } else if self.eat_kw("UNIQUE") {
-            ConstraintKind::Unique(self.ident_list()?)
-        } else if self.eat_kw("CHECK") {
-            self.expect_sym("(")?;
-            let e = self.expr()?;
-            self.expect_sym(")")?;
-            ConstraintKind::Check(e)
-        } else if self.eat_kw("FOREIGN") {
-            self.expect_kw("KEY")?;
-            let columns = self.ident_list()?;
-            self.expect_kw("REFERENCES")?;
-            let (table, ref_columns) = self.references()?;
-            ConstraintKind::ForeignKey {
-                columns,
-                table,
-                ref_columns,
+        let kind = self.constraint_kind(None)?;
+        self.constraint_state(name, kind)
+    }
+
+    /// The constraint forms of ALTER TABLE.
+    fn alter_table(&mut self) -> Result<Statement, OraError> {
+        self.pos += 2;
+        let name = self.object_name()?;
+        let invalid = || OraError::new(1735, "invalid ALTER TABLE option");
+        let action = if self.eat_kw("ADD") {
+            let mut constraints = Vec::new();
+            if self.eat_sym("(") {
+                loop {
+                    constraints.push(self.table_constraint()?);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+            } else {
+                while ["CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"]
+                    .iter()
+                    .any(|k| self.is_kw(k))
+                {
+                    constraints.push(self.table_constraint()?);
+                }
+            }
+            if constraints.is_empty() {
+                return Err(invalid());
+            }
+            AlterTableAction::AddConstraints(constraints)
+        } else if self.eat_kw("DROP") {
+            let name = if self.eat_kw("PRIMARY") {
+                self.expect_kw("KEY")?;
+                None
+            } else if self.eat_kw("CONSTRAINT") {
+                Some(self.ident()?)
+            } else {
+                return Err(invalid());
+            };
+            let cascade = self.eat_kw("CASCADE");
+            if self.eat_kw("KEEP") || self.eat_kw("DROP") {
+                self.expect_kw("INDEX")?;
+            }
+            AlterTableAction::DropConstraint { name, cascade }
+        } else if self.is_kw("ENABLE") || self.is_kw("DISABLE") {
+            let enabled = self.eat_kw("ENABLE");
+            if !enabled {
+                self.advance();
+            }
+            let validate = !self.eat_kw("NOVALIDATE");
+            self.eat_kw("VALIDATE");
+            let name = if self.eat_kw("PRIMARY") {
+                self.expect_kw("KEY")?;
+                None
+            } else {
+                self.expect_kw("CONSTRAINT")?;
+                Some(self.ident()?)
+            };
+            let cascade = self.eat_kw("CASCADE");
+            if self.eat_kw("KEEP") || self.eat_kw("DROP") {
+                self.expect_kw("INDEX")?;
+            }
+            AlterTableAction::SetConstraint {
+                name,
+                enabled,
+                validate,
+                cascade,
+            }
+        } else if self.eat_kw("MODIFY") {
+            self.expect_kw("CONSTRAINT")?;
+            let name = Some(self.ident()?);
+            let c = self.constraint_state(None, ConstraintKind::Unique(Vec::new()))?;
+            let cascade = self.eat_kw("CASCADE");
+            AlterTableAction::SetConstraint {
+                name,
+                enabled: c.enabled,
+                validate: c.validate,
+                cascade,
             }
         } else {
-            return Err(OraError::new(
-                2253,
-                "constraint specification not allowed here",
-            ));
+            return Err(invalid());
         };
-        if !self.eat_kw("ENABLE") {
-            self.eat_kw("DISABLE");
+        if self.peek().is_some() {
+            return Err(OraError::new(933, "SQL command not properly ended"));
         }
-        Ok(TableConstraint { name, kind })
+        Ok(Statement::AlterTable { name, action })
     }
 
     fn length(&mut self) -> Result<Option<u32>, OraError> {
@@ -1786,6 +1923,14 @@ mod tests {
             "create table t as select * from u",
             "create unique index t_ix on t (a, b desc)",
             "drop table t cascade constraints purge",
+            "create table t (id number not null enable, p number, constraint t_pk primary key (id) using index tablespace users enable, constraint t_fk foreign key (p) references s.p (id) on delete set null deferrable initially deferred novalidate)",
+            "alter table t add constraint t_fk foreign key (a, b) references p (a, b) enable",
+            "alter table s.t add (constraint t_uk unique (a) using index (create index i on t (a)), check (a > 0) disable)",
+            "alter table t drop constraint t_fk cascade drop index",
+            "alter table t drop primary key keep index",
+            "alter table t disable novalidate constraint t_fk",
+            "alter table t enable primary key",
+            "alter table t modify constraint t_fk enable novalidate",
             "truncate table t",
             "alter session set nls_date_format = 'YYYY-MM-DD'",
             "commit work",

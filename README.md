@@ -1,5 +1,7 @@
 # mock-oracle
 
+[![codecov](https://codecov.io/gh/bantini/mock-oracle/graph/badge.svg)](https://codecov.io/gh/bantini/mock-oracle)
+
 A slim, in-memory stand-in for Oracle Database in CI/CD pipelines. It speaks Oracle's network protocol, so node-oracledb connects to it unchanged, and it runs Oracle SQL and PL/SQL against tables held in memory. It starts in milliseconds, needs no Oracle installation or license, and forgets everything when it stops.
 
 You can use it in two ways:
